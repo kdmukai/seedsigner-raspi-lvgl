@@ -52,6 +52,10 @@ struct LvglLockGuard {
 // Drive lv_timer_handler for duration_ms (sleep_ms between iterations).
 // Returns 0 normally, -1 if a Python exception/signal is pending.
 int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms);
+// Stop + join the RASPI-5 Phase-2 background pump thread. Idempotent. Registered with
+// Py_AtExit at module init so the thread is joined even if the app never calls
+// lvgl_shutdown() (a joinable std::thread would std::terminate at static destruction).
+extern "C" void lvgl_runtime_join_pump_thread(void);
 // Load a fresh all-black screen and pump briefly so it reaches the panel.
 // clean_sys_layer additionally clears lv_layer_sys() overlays first.
 void lvgl_clear_to_black(bool clean_sys_layer);
@@ -60,6 +64,10 @@ void lvgl_clear_to_black(bool clean_sys_layer);
 
 // True when the native ST7789 flush path is initialized and selected.
 bool native_flush_active();
+// Select native flush as the flush mode (RASPI-5 Phase 2 — armed at lvgl_init so the
+// background pump never takes the Python flush path). Gated by s_native.ready, so it only
+// paints once native_display_init has brought up the panel.
+void native_flush_select_native();
 // Native-path flush body: debug logging, optional RGB565 byte swap, SPI blit.
 // Catches and logs its own errors (a failed flush must not kill the pump loop).
 void native_flush_blit(const lv_area_t *area, const uint8_t *px_map, size_t nbytes);

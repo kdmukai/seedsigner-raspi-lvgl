@@ -136,6 +136,11 @@ PyMODINIT_FUNC PyInit_seedsigner_lvgl_screens(void) {
     if (!m) {
         return NULL;
     }
+    // RASPI-5 Phase 2: the background LVGL pump thread (spawned by lvgl_init) is a joinable
+    // std::thread; if the app exits without calling lvgl_shutdown() it would std::terminate
+    // at static destruction. Join it at interpreter finalization as a safety net (idempotent
+    // with an explicit lvgl_shutdown()).
+    Py_AtExit(lvgl_runtime_join_pump_thread);
 #ifdef SS_CAMERA_ENGINE
     // Attach the nested `camera_scanner` (QR) + `camera_entropy` (image-entropy) submodules
     // (native libcamera capture engines; ESP camera_scanner / camera_entropy contracts).

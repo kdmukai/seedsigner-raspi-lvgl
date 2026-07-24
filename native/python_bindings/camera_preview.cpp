@@ -10,13 +10,13 @@
 // portable overlay on top. The screens submodule needs no changes — the overlay is
 // called as a black box.
 //
-// Execution model (Stage 1, host-driven pump): Python captures a frame (picamera),
-// converts it to RGB565, calls camera_preview_set_frame(bytes), then lvgl_pump().
-// Decode (pyzbar/DecodeQR) stays in Python; camera_preview_set_progress() advances
-// the overlay a few times/sec (never per frame). All calls happen under the GIL and,
-// in the app, under renderer.lock — single-writer, so no extra locking here. Post
-// display-driver cutover a native background task will pump (like ESP32); keep these
-// calls cheap + lock-safe so they survive that move (ESP cam_present is the template).
+// Execution model: the native camera engine (camera_engine.cpp) captures + converts
+// frames on worker threads and publishes them into this sink from the background pump
+// thread's consume hook (RASPI-5 Phase 2 — the ESP taskLVGL model). LVGL core is not
+// thread-safe, so every host binding here that touches the sink or the overlay holds the
+// LVGL lock (LvglLockGuard) to serialize against that pump thread. The overlay-state
+// calls (set_progress/report/...) run a few times/sec, never per frame. The legacy Python
+// frame-push (camera_preview_set_frame) takes the same lock and retires with the PIL sunset.
 //
 // FRAME FORMAT CONTRACT: set_frame() takes LVGL-NATIVE RGB565 (w*h*2 bytes), NEVER
 // pre-swapped for the panel. Once a frame is lv_image content the active flush driver
@@ -353,9 +353,17 @@ PyObject *py_camera_preview_screen(PyObject *self, PyObject *args) {
 }
 
 // --- Native-engine sink bridge (camera_preview_sink.h) ----------------------
-// Python-free entry points the native camera engine calls (camera_engine.cpp). All
-// three run on the pump/LVGL thread — the engine's consume hook fires inside
-// lvgl_runtime_pump — so blit_rgb565's lv_obj_invalidate stays on the LVGL locus.
+// Python-free entry points the native camera engine calls (camera_engine.cpp). The
+// thread model is NOT uniform, so the locking differs per function (RASPI-5 Phase 2):
+//   * blit_rgb565 runs pump-thread-ONLY: the engine's consume hook fires inside
+//     pump_one_iteration, already under the LVGL lock — so its lv_obj_invalidate stays on
+//     the LVGL locus and it needs no lock of its own.
+//   * session_active / get_sink_dims are called on the HOST thread (from camera_scanner /
+//     camera_entropy start() and from camera_engine_start()/entropy_engine_start()), never
+//     from the pump. In the io_test-grab case they read LVGL widget state via
+//     io_test_get_camera_plane_dims, which would race the concurrent pump thread — so each
+//     takes the LVGL lock itself. (The engine start() callers hold no lock, so this is a
+//     fresh, brief acquisition released before the blocking bring-up — never held across it.)
 //
 // io_test grab redirect: io_test_screen owns its OWN square pixel plane (SCREENS-9),
 // not the camera_preview sink. While an io_test single-frame grab is active, this bridge
@@ -368,6 +376,10 @@ static bool s_io_test_grab = false;
 static std::vector<uint8_t> s_io_test_last_frame;  // last converted frame during a grab
 
 bool camera_preview_session_active() {
+    // Host-thread entry: serialize the io_test_get_camera_plane_dims LVGL read (and the
+    // sink-pointer reads) against the background pump thread. Recursive lock — harmless if
+    // a future caller already holds it.
+    LvglLockGuard _lvgl_guard;
     if (s_io_test_grab) {
         int w = 0, h = 0;
         io_test_get_camera_plane_dims(&w, &h);
@@ -377,6 +389,8 @@ bool camera_preview_session_active() {
 }
 
 void camera_preview_get_sink_dims(int *w, int *h) {
+    // Host-thread entry: serialize the LVGL read against the background pump thread.
+    LvglLockGuard _lvgl_guard;
     if (s_io_test_grab) {
         io_test_get_camera_plane_dims(w, h);
         return;
@@ -412,18 +426,33 @@ PyObject *py_io_test_camera_start(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 #ifdef SS_CAMERA_ENGINE
-    // Requires an active io_test_screen — its plane is the redirect target.
-    LvglLockGuard _lvgl_guard;
+    // Requires an active io_test_screen — its plane is the redirect target. Read the plane
+    // dims AND arm the redirect under the LVGL lock, then RELEASE before
+    // camera_engine_start(): the engine call spawns worker threads and does (possibly
+    // blocking) libcamera bring-up, and must NEVER run while we hold the LVGL lock (it
+    // would stall the background pump thread — §follow-up-1). Setting s_io_test_grab under
+    // the lock also publishes it (release/acquire via the LVGL lock) so the pump thread's
+    // blit_rgb565 reliably observes the armed redirect. camera_engine_start() re-reads the
+    // plane dims via the self-locking sink bridge, so that read stays serialized without us
+    // holding the lock across the engine call.
     int w = 0, h = 0;
-    io_test_get_camera_plane_dims(&w, &h);
+    {
+        LvglLockGuard _lvgl_guard;
+        io_test_get_camera_plane_dims(&w, &h);
+        if (w > 0 && h > 0) {
+            s_io_test_last_frame.clear();  // fresh grab: discard any prior still
+            s_io_test_grab = true;
+        }
+    }
     if (w <= 0 || h <= 0) {
         PyErr_SetString(PyExc_RuntimeError, "io_test_camera_start: no active io_test_screen");
         return nullptr;
     }
-    s_io_test_last_frame.clear();  // fresh grab: discard any prior still
-    s_io_test_grab = true;
     int err = camera_engine_start();
     if (err != CAMERA_OK) {
+        // Bring-up failed: the engine is torn down (g == nullptr), so the pump's consume
+        // no longer calls blit_rgb565 — disarm the redirect under the lock all the same.
+        LvglLockGuard _lvgl_guard;
         s_io_test_grab = false;
         PyErr_SetObject(PyExc_OSError, Py_BuildValue("(is)", err, camera_error_str(err)));
         return nullptr;
@@ -441,10 +470,13 @@ PyObject *py_io_test_camera_stop(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 #ifdef SS_CAMERA_ENGINE
+    // Stop OUTSIDE the LVGL lock (it joins the engine worker threads — must not stall the
+    // pump). After it returns g == nullptr, so the pump's consume no longer calls
+    // blit_rgb565: disarming the redirect + revealing the still below is then race-free.
     camera_engine_stop();
 #endif
-    s_io_test_grab = false;
     LvglLockGuard _lvgl_guard;
+    s_io_test_grab = false;
     // Reveal ONLY the final captured frame — a single still, no live video. Empty if the
     // engine delivered nothing (camera failed to start/produce a frame); then leave the
     // plane dark. Sizing/no-active-screen are guarded inside io_test_blit_camera.

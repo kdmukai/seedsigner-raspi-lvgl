@@ -283,6 +283,14 @@ bool native_flush_active() {
     return s_use_native_flush && s_native.ready;
 }
 
+// RASPI-5 Phase 2: arm native flush as the selected mode (design §4). native_flush_active()
+// still gates on s_native.ready, so this is a no-op paint until native_display_init brings up
+// the panel — at which point the flush is native without the app calling set_flush_mode.
+// The background pump thread requires this: the Python flush path would deadlock it (§3.1).
+void native_flush_select_native() {
+    s_use_native_flush = true;
+}
+
 void native_flush_blit(const lv_area_t *area, const uint8_t *px_map, size_t nbytes) {
     int w = area->x2 - area->x1 + 1;
     int h = area->y2 - area->y1 + 1;

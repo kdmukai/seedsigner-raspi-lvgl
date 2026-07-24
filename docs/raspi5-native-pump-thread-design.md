@@ -115,8 +115,16 @@ rates; the ESP side omits synchronization entirely and relies on SPSC discipline
 - **Native camera engine** (`camera_engine.cpp`, `camera_entropy_engine.cpp`): already runs
   libcamera-manager-thread producers → a blit-worker `std::thread` → publish under `out_mtx` →
   `camera_engine_pump_consume()` (called on the pump thread) is the *only* step that calls
-  `lv_obj_invalidate`. This already assumes the exact model RASPI-5 introduces — it is the template
-  for "worker threads produce, only the pump-thread consume touches LVGL," and it does **not** break.
+  `lv_obj_invalidate`. This already assumes the exact model RASPI-5 introduces — the template for
+  "worker threads produce, only the pump-thread consume touches LVGL." **One gap the GIL used to
+  cover, though:** the engine *handle* `g` is created by `start()` and `delete`d by `stop()` /
+  `bringup_failed()` on the host thread, while `pump_consume()` derefs it on the pump thread. Under
+  the flip those overlap (they were GIL-serialized before) → a use-after-free. Each engine now owns a
+  Python-free lifecycle `std::mutex` held around ONLY the `g` pointer transitions and the whole
+  `pump_consume()` body (never across the blocking libcamera teardown), ordered LVGL → engine-mutex →
+  `out_mtx`. The sink-bridge (`camera_preview.cpp`) is split by locus too: `blit_rgb565` is
+  pump-thread-only (under the LVGL lock via consume); `session_active` / `get_sink_dims` are
+  host-thread entries that self-take the LVGL lock (they read LVGL state in the io_test-grab path).
 - **Toast / overlay manager**: the portable screens library defines `overlay_manager_lock()` /
   `unlock()` as **weak no-op seams**
   ([`overlay_manager.cpp:49`](../sources/seedsigner-lvgl-screens/components/seedsigner/overlay_manager.cpp#L49))

@@ -142,6 +142,13 @@ struct Engine {
 
 Engine *g = nullptr;
 
+// RASPI-5 Phase 2: the g pointer's LIFECYCLE lock — same contract as the scan engine's.
+// camera_entropy_engine_pump_consume() runs on the GIL-free background pump thread,
+// concurrently with start()/stop()/bringup_failed() on the host thread. Held only around
+// the g pointer transitions and the whole consume body, never across the blocking libcamera
+// teardown. Ordering: consume takes it UNDER the LVGL lock, then g->out_mtx.
+std::mutex s_engine_mtx;
+
 // BT.601 studio-range YUV420 -> RGB565 with 0/90/180/270 rotation. Identical to the scan
 // engine's convert (kept local so the two engines stay independent; correctness-sensitive
 // so copied verbatim rather than re-derived).
@@ -391,6 +398,9 @@ int bringup_failed(int code) {
         if (g->manager) {
             g->manager->stop();
         }
+        // Publish g == nullptr under the lifecycle lock (teardown above ran lock-free) so a
+        // concurrent pump-thread consume never derefs a freed engine.
+        std::lock_guard<std::mutex> lk(s_engine_mtx);
         delete g;
         g = nullptr;
     }
@@ -410,7 +420,12 @@ int camera_entropy_engine_start() {
         return CAMERA_ERR_NO_SINK;
     }
 
-    g = new Engine();
+    // Publish the new engine under the lifecycle lock (see s_engine_mtx) so the pump-thread
+    // consume observes a fully-constructed g. Written once here; bring-up only reads it after.
+    {
+        std::lock_guard<std::mutex> lk(s_engine_mtx);
+        g = new Engine();
+    }
     // Same sticky device setting the scan engine reads (camera_config.h), so both
     // flows honour one rotation.
     g->rotate = camera_config_effective_rotation();
@@ -606,8 +621,13 @@ void camera_entropy_engine_stop() {
     if (!g->still_scratch.empty()) {
         ss_secure_zero(g->still_scratch.data(), g->still_scratch.size());
     }
-    delete g;
-    g = nullptr;
+    // Publish g == nullptr under the lifecycle lock (teardown above ran lock-free) so a
+    // concurrent pump-thread consume never derefs a freed engine.
+    {
+        std::lock_guard<std::mutex> lk(s_engine_mtx);
+        delete g;
+        g = nullptr;
+    }
     entropy_coord_wipe();
 }
 
@@ -616,6 +636,10 @@ bool camera_entropy_engine_is_running() {
 }
 
 void camera_entropy_engine_pump_consume() {
+    // Runs on the background pump thread (under the LVGL lock). Hold the lifecycle lock for
+    // the whole body so the host thread can't free g mid-deref. Order: LVGL -> s_engine_mtx
+    // -> out_mtx.
+    std::lock_guard<std::mutex> lk_g(s_engine_mtx);
     if (!g) {
         return;
     }

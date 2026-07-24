@@ -42,13 +42,17 @@
 // --- Cross-thread lock: the strong override of overlay_manager's weak hooks --------
 // overlay_manager_lock()/unlock() are weak no-ops in overlay_manager.cpp (fine for
 // single-threaded hosts: the ESP32 LVGL task, the desktop runner, web). The Pi has
-// genuine cross-thread producers (the SD-card detector thread + the pump thread both
-// call overlay_manager_show_toast), so it must supply a real mutex — as documented in
+// genuine cross-thread producers, so it must supply a real mutex — as documented in
 // overlay_manager.h. It guards the manager's staged-toast request: the producer copies
-// the spec under it, the dispatcher drains under it. On CPython the GIL already
-// serializes both sides while each holds it, but this makes the invariant explicit and
-// robust to any future producer that releases the GIL around the call (the pump loop's
-// only synchronization is the GIL; nothing forbids a producer from dropping it).
+// the spec under it, the dispatcher (an lv_timer inside the LVGL loop) drains under it.
+//
+// This mutex is LOAD-BEARING under RASPI-5 Phase 2: the dispatcher now runs on the
+// background pump thread (GIL-free), so the GIL no longer serializes producer vs.
+// dispatcher. Producers are the SD-card detector thread and any UI thread calling
+// show_toast; each takes ONLY this overlay lock (O). The dispatcher runs UNDER the LVGL
+// lock (L) and then takes O to drain — order L -> O. No producer ever takes L, so there
+// is no L/O cycle (no AB-BA). dismiss_toast deletes widgets directly and stays LVGL-thread
+// only (it takes the LVGL lock, not this one).
 static std::mutex &overlay_state_mutex() {
     static std::mutex m;   // function-local static: thread-safe first-use init, no
     return m;              // static-init-order dependence on this translation unit.

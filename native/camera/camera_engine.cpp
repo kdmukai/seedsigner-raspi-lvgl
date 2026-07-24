@@ -111,6 +111,16 @@ struct Engine {
 
 Engine *g = nullptr;
 
+// RASPI-5 Phase 2: the g pointer's LIFECYCLE lock. camera_engine_pump_consume() now runs
+// on the background pump thread (GIL-free), concurrently with start()/stop()/bringup_failed()
+// on the host thread — the GIL used to serialize them. Without this, consume could deref g
+// while stop() does `delete g` (use-after-free). This leaf mutex is held around ONLY the g
+// pointer transitions (publish / delete) and the whole consume body, never across the
+// blocking libcamera teardown — so it never stalls the pump. Ordering: consume takes it
+// UNDER the LVGL lock (pump), then g->out_mtx — a strict LVGL -> s_engine_mtx -> out_mtx
+// order, and nothing acquires the LVGL lock while holding it, so there is no cycle.
+std::mutex s_engine_mtx;
+
 // Lifetime counters, namespace-static so they survive g's deletion on stop() (the
 // harness reads them after the session ends). Reset at each start().
 std::atomic<uint64_t> s_n_in{0};    // frames captured by the manager thread
@@ -325,6 +335,9 @@ int bringup_failed(int code) {
         if (g->manager) {
             g->manager->stop();
         }
+        // Publish g == nullptr under the lifecycle lock so a concurrent pump-thread consume
+        // never derefs a freed engine (the blocking teardown above ran lock-free).
+        std::lock_guard<std::mutex> lk(s_engine_mtx);
         delete g;
         g = nullptr;
     }
@@ -341,7 +354,14 @@ int camera_engine_start() {
         return CAMERA_ERR_NO_SINK;
     }
 
-    g = new Engine();
+    // Publish the new engine under the lifecycle lock so the pump-thread consume observes a
+    // fully-constructed g (never a torn pointer). g is written exactly once here; the rest
+    // of bring-up only reads it and mutates members disjoint from consume's (out_mtx/dirty/
+    // ready_buf), and the blit worker that fills those isn't spawned until below.
+    {
+        std::lock_guard<std::mutex> lk(s_engine_mtx);
+        g = new Engine();
+    }
     // Sticky device setting, sampled once per session: the user's delta composed
     // with the sensor-mount base (camera_config.h).
     g->rotate = camera_config_effective_rotation();
@@ -540,6 +560,9 @@ void camera_engine_stop() {
         g->manager->stop();
         g->manager.reset();
     }
+    // Publish g == nullptr under the lifecycle lock, AFTER the blocking teardown above ran
+    // lock-free — so a concurrent pump-thread consume never derefs a freed engine (§3.4).
+    std::lock_guard<std::mutex> lk(s_engine_mtx);
     delete g;
     g = nullptr;
 }
@@ -549,6 +572,10 @@ bool camera_engine_is_running() {
 }
 
 void camera_engine_pump_consume() {
+    // Runs on the background pump thread (under the LVGL lock). Hold the lifecycle lock for
+    // the whole body so start()/stop()/bringup_failed() on the host thread can't free g
+    // mid-deref (§3.4). Leaf order: LVGL(held) -> s_engine_mtx -> out_mtx.
+    std::lock_guard<std::mutex> lk_g(s_engine_mtx);
     if (!g) {
         return;
     }
