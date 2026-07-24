@@ -178,6 +178,8 @@ PyObject *py_dismiss_toast(PyObject *self, PyObject *args) {
     (void)args;
     try {
         require_lvgl_runtime();
+        // Deletes the banner widget + its timer — serialize vs the pump thread's render.
+        LvglLockGuard _lvgl_guard;
         toast_overlay_dismiss();
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());

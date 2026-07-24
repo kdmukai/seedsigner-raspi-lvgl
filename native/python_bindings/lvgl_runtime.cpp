@@ -15,8 +15,16 @@
 #endif
 
 #include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
+
+// RASPI-5 LVGL global lock (see module_internal.h). Recursive so a locked mutator
+// may re-enter another locked path on the same thread. Single acquisition / no GIL
+// nesting until Phase 2 spawns the background pump thread.
+static std::recursive_mutex s_lvgl_mtx;
+void lvgl_lock() { s_lvgl_mtx.lock(); }
+void lvgl_unlock() { s_lvgl_mtx.unlock(); }
 
 static bool s_lvgl_inited = false;
 static std::vector<uint8_t> s_buf1;  // RGB565: 2 bytes/pixel, sized at runtime
@@ -170,16 +178,22 @@ int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms) {
     auto start = std::chrono::steady_clock::now();
     while (true) {
         lvgl_tick_update();
+        {
+            // All LVGL core work runs under the LVGL lock (RASPI-5). The tick update
+            // above is a thread-safe single-writer lv_tick_inc, and the signal check
+            // below is a GIL op — both stay OUTSIDE the lock so the (Phase-2) pump
+            // thread never holds the GIL while holding the LVGL lock.
+            LvglLockGuard _lvgl_guard;
 #ifdef SS_CAMERA_ENGINE
-        // Publish the newest engine-converted camera frame into the preview sink
-        // (under the render lock) BEFORE rendering, so this pump paints it. No-op
-        // when no capture session is active. This is the ONLY place an engine frame
-        // reaches LVGL — invalidate stays on the LVGL locus (spec §4.9). Scan and entropy
-        // engines are mutually exclusive, so at most one publishes per pump.
-        camera_engine_pump_consume();
-        camera_entropy_engine_pump_consume();
+            // Publish the newest engine-converted camera frame into the preview sink
+            // BEFORE rendering, so this pump paints it. No-op when no capture session
+            // is active. This is the ONLY place an engine frame reaches LVGL. Scan and
+            // entropy engines are mutually exclusive, so at most one publishes per pump.
+            camera_engine_pump_consume();
+            camera_entropy_engine_pump_consume();
 #endif
-        lv_timer_handler();
+            lv_timer_handler();
+        }
 
         // Check for exceptions raised inside flush callbacks (e.g.
         // KeyboardInterrupt) or new pending signals (Ctrl+C).
@@ -198,13 +212,19 @@ int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms) {
 }
 
 void lvgl_clear_to_black(bool clean_sys_layer) {
-    if (clean_sys_layer) {
-        lv_obj_clean(lv_layer_sys());
+    {
+        // Serialize the widget-tree build against the pump thread; release before
+        // pumping (lvgl_runtime_pump takes the lock itself, per iteration). This
+        // guard also covers py_clear_screen, whose only LVGL access is via here.
+        LvglLockGuard _lvgl_guard;
+        if (clean_sys_layer) {
+            lv_obj_clean(lv_layer_sys());
+        }
+        lv_obj_t *scr = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_scr_load(scr);
     }
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_scr_load(scr);
     lvgl_runtime_pump(50, 5);
 }
 
@@ -259,6 +279,10 @@ PyObject *py_set_resolution(PyObject *self, PyObject *args, PyObject *kwargs) {
         Py_RETURN_NONE;  // already at requested resolution
     }
 
+    // Serialize the whole display teardown+recreate against the pump thread — this
+    // deletes and rebuilds the display and every screen (the sharpest call to lock).
+    LvglLockGuard _lvgl_guard;
+
     // Update the active display profile (aborts if no profile matches).
     set_display(width, height);
 
@@ -310,6 +334,7 @@ PyObject *py_display_size(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
+    LvglLockGuard _lvgl_guard;
     const DisplayProfile &p = active_profile();
     return Py_BuildValue("(ii)", p.width, p.height);
 }
@@ -360,6 +385,7 @@ PyObject *py_save_screen(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         s_saved_screen = lv_scr_act();
 
         // Save the current indev group.
@@ -383,6 +409,7 @@ PyObject *py_restore_screen(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         if (!s_saved_screen) {
             Py_RETURN_NONE;  // nothing saved — no-op
         }
@@ -442,6 +469,9 @@ PyObject *py_set_screensaver_timeout(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "I", &ms)) {
         return NULL;
     }
+    // A 0 timeout dismisses an active screensaver (loads/deletes screens), so this can
+    // touch LVGL — serialize against the pump thread.
+    LvglLockGuard _lvgl_guard;
     overlay_manager_set_screensaver_timeout(static_cast<uint32_t>(ms));
     Py_RETURN_NONE;
 }
@@ -471,6 +501,7 @@ PyObject *py_get_inactive_time_ms(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
+    LvglLockGuard _lvgl_guard;
     uint32_t ms = lv_display_get_inactive_time(s_disp);
     return PyLong_FromUnsignedLong(static_cast<unsigned long>(ms));
 }

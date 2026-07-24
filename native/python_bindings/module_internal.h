@@ -31,6 +31,24 @@
 // Throws std::runtime_error if lvgl_init() has not been called.
 void require_lvgl_runtime();
 bool lvgl_runtime_is_inited();
+
+// LVGL global lock (RASPI-5). LVGL core is not thread-safe; every host->widget-tree
+// call and the pump loop's lv_timer_handler holds this recursive lock so the
+// background pump thread (Phase 2) and the host binding thread serialize. Recursive
+// so a locked mutator may call a helper that re-locks (e.g. clear_screen ->
+// lvgl_clear_to_black -> lvgl_runtime_pump). Strict lock ordering: the pump thread
+// takes ONLY this lock; host bindings hold the GIL then take it — so NEVER acquire
+// the GIL while holding this lock (that is the GIL<->LVGL deadlock the design avoids).
+// Uncontended (a no-op) until Phase 2 spawns the pump thread.
+void lvgl_lock();
+void lvgl_unlock();
+// RAII: lock for the enclosing scope, unlock on every exit path (including throws).
+struct LvglLockGuard {
+    LvglLockGuard() { lvgl_lock(); }
+    ~LvglLockGuard() { lvgl_unlock(); }
+    LvglLockGuard(const LvglLockGuard &) = delete;
+    LvglLockGuard &operator=(const LvglLockGuard &) = delete;
+};
 // Drive lv_timer_handler for duration_ms (sleep_ms between iterations).
 // Returns 0 normally, -1 if a Python exception/signal is pending.
 int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms);

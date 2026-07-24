@@ -57,6 +57,7 @@ PyObject *py_set_locale(PyObject *self, PyObject *args) {
         // Font registration rasterizes via tiny_ttf, which needs a live LVGL
         // runtime (lv_init + an allocator). Guard it the same way screens do.
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
 
         FsPackCtx ctx;
         ctx.font_dir = font_dir;
@@ -78,6 +79,7 @@ PyObject *py_unload_locale(PyObject *self, PyObject *args) {
     (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         ss_unload_locale();
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());

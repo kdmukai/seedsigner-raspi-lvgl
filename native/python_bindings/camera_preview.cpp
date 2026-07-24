@@ -89,6 +89,7 @@ static void camera_preview_teardown() {
 // subsequent lvgl_init() + set_frame/build can't dereference a freed lv_obj (the
 // build-time tests init/shutdown the runtime repeatedly across modules).
 void camera_preview_on_lvgl_shutdown() {
+    LvglLockGuard _lvgl_guard;
     camera_preview_teardown();
 }
 
@@ -96,6 +97,7 @@ void camera_preview_on_lvgl_shutdown() {
 // drop the overlay handle + sink buffer and reset LVGL's idle clock so the successor
 // screen gets a full screensaver window. Idempotent.
 void camera_preview_close_session() {
+    LvglLockGuard _lvgl_guard;
     camera_preview_teardown();
     if (lvgl_runtime_is_inited()) {
         lv_display_trigger_activity(NULL);
@@ -110,6 +112,7 @@ void camera_preview_close_session() {
 void camera_preview_build_session(const std::string &instructions) {
     {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
 
         // A rebuild without close() first must not leak the prior handle.
         if (s_overlay) {
@@ -205,6 +208,7 @@ void camera_entropy_build_session(const std::string &preview_instructions,
                                   const std::string &capturing_text,
                                   const std::string &accept_label) {
     require_lvgl_runtime();
+    LvglLockGuard _lvgl_guard;
 
     // A rebuild without close() first must not leak a prior handle (either overlay).
     if (s_overlay) {
@@ -280,6 +284,7 @@ void camera_entropy_build_session(const std::string &preview_instructions,
 // Flip the entropy overlay's phase (camera_entropy.capture()→CAPTURING, get_result()'s
 // first latch→CONFIRM, resume()→PREVIEW). No-op when no entropy overlay is active.
 void camera_entropy_set_phase(int phase) {
+    LvglLockGuard _lvgl_guard;
     if (s_entropy_overlay) {
         camera_entropy_overlay_set_phase(s_entropy_overlay, (camera_entropy_phase_t)phase);
     }
@@ -301,6 +306,7 @@ void camera_entropy_build_confirm_image(const uint8_t *raw_rgb565, int src_w, in
     if (!lvgl_runtime_is_inited()) {
         return;
     }
+    LvglLockGuard _lvgl_guard;
     const int32_t dw = lv_display_get_horizontal_resolution(NULL);
     const int32_t dh = lv_display_get_vertical_resolution(NULL);
     std::vector<uint16_t> disp(static_cast<size_t>(dw) * static_cast<size_t>(dh));
@@ -337,6 +343,7 @@ PyObject *py_camera_preview_screen(PyObject *self, PyObject *args) {
     }
 
     try {
+        LvglLockGuard _lvgl_guard;
         camera_preview_build_session(instructions);
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -406,6 +413,7 @@ PyObject *py_io_test_camera_start(PyObject *self, PyObject *args) {
     (void)args;
 #ifdef SS_CAMERA_ENGINE
     // Requires an active io_test_screen — its plane is the redirect target.
+    LvglLockGuard _lvgl_guard;
     int w = 0, h = 0;
     io_test_get_camera_plane_dims(&w, &h);
     if (w <= 0 || h <= 0) {
@@ -436,6 +444,7 @@ PyObject *py_io_test_camera_stop(PyObject *self, PyObject *args) {
     camera_engine_stop();
 #endif
     s_io_test_grab = false;
+    LvglLockGuard _lvgl_guard;
     // Reveal ONLY the final captured frame — a single still, no live video. Empty if the
     // engine delivered nothing (camera failed to start/produce a frame); then leave the
     // plane dark. Sizing/no-active-screen are guarded inside io_test_blit_camera.
@@ -463,6 +472,8 @@ PyObject *py_camera_preview_set_frame(PyObject *self, PyObject *args) {
         PyBuffer_Release(&view);
         Py_RETURN_NONE;  // no active session — no-op
     }
+
+    LvglLockGuard _lvgl_guard;
 
     if (static_cast<size_t>(view.len) != s_cam_size) {
         PyErr_Format(PyExc_ValueError,
@@ -500,6 +511,8 @@ PyObject *py_camera_preview_set_frame_yuv420(PyObject *self, PyObject *args) {
         PyBuffer_Release(&view);
         Py_RETURN_NONE;  // no active session — no-op
     }
+
+    LvglLockGuard _lvgl_guard;
 
     if (src_w <= 0 || src_h <= 0 || (src_w & 1) || (src_h & 1) ||
         y_stride < src_w || uv_stride < (src_w + 1) / 2) {
@@ -582,6 +595,7 @@ PyObject *py_camera_preview_set_progress(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "ii", &percent, &frame_status)) {
         return nullptr;
     }
+    LvglLockGuard _lvgl_guard;
     if (s_overlay) {
         camera_preview_overlay_set_progress(
             s_overlay, percent, (camera_overlay_frame_status_t)frame_status);
@@ -592,6 +606,7 @@ PyObject *py_camera_preview_set_progress(PyObject *self, PyObject *args) {
 // C++ helper shared by the Python binding and camera_scanner.start(): toggle the
 // overlay between the back-affordance state and the scanning status-bar state.
 void camera_preview_set_scanning_active(bool active) {
+    LvglLockGuard _lvgl_guard;
     if (s_overlay) {
         camera_preview_overlay_set_scanning(s_overlay, active);
     }
@@ -603,6 +618,7 @@ void camera_preview_set_scanning_active(bool active) {
 // the Phase-0 surface. No-op when no overlay is active.
 void camera_preview_report(int frame_status, int percent) {
     if (!s_overlay) return;
+    LvglLockGuard _lvgl_guard;
     // Only a multi-part decode ever reports a percent strictly between 0 and 100; an idle/held
     // frame reports pct == 0 (FRAME_REPEAT/FRAME_NONE) and does not count as partial progress.
     if (percent > 0 && percent < 100) s_scan_saw_partial = true;
@@ -623,12 +639,14 @@ void camera_preview_report(int frame_status, int percent) {
 // overlay derives the percent from its own lit count. UR/fountain + single-frame QRs stay
 // on camera_preview_report() (the continuous bar). No-op when no overlay is active.
 void camera_preview_begin_segments(int total_segments) {
+    LvglLockGuard _lvgl_guard;
     if (s_overlay) {
         camera_preview_overlay_begin_segments(s_overlay, total_segments);
     }
 }
 
 void camera_preview_segment_event(int frame_status, int piece_index) {
+    LvglLockGuard _lvgl_guard;
     if (s_overlay) {
         camera_preview_overlay_segment_event(
             s_overlay, (camera_overlay_frame_status_t)frame_status, piece_index);
@@ -644,6 +662,7 @@ PyObject *py_camera_preview_set_scanning(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "p", &active)) {
         return nullptr;
     }
+    LvglLockGuard _lvgl_guard;
     camera_preview_set_scanning_active(active != 0);
     Py_RETURN_NONE;
 }
@@ -656,6 +675,7 @@ PyObject *py_camera_preview_set_scanning(PyObject *self, PyObject *args) {
 PyObject *py_camera_preview_close(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
+    LvglLockGuard _lvgl_guard;
     // Reset LVGL's idle clock so the successor screen gets a full screensaver window:
     // a no-input scan leaves inactive-time large, which would otherwise immediately
     // fire the saver over the next (flag-free) screen.
