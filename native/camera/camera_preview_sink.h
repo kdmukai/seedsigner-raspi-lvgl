@@ -3,9 +3,12 @@
 // portable overlay chrome). camera_preview.cpp implements these; camera_engine.cpp
 // calls them so it never has to include Python.h or touch PyObject.
 //
-// All three run on the pump/LVGL thread (the engine's consume hook is called from
-// lvgl_runtime_pump): blit_rgb565 memcpies into the sink and invalidates on the
-// LVGL locus, so no LVGL mutation happens on an engine worker thread (spec §4.9).
+// The thread model differs per function (RASPI-5 Phase 2 — see camera_preview.cpp):
+// blit_rgb565 runs on the pump/LVGL thread ONLY (the engine's consume hook fires under the
+// LVGL lock), so it memcpies into the sink and invalidates on the LVGL locus — no LVGL
+// mutation on an engine worker thread (spec §4.9). session_active / get_sink_dims are
+// called on the HOST thread (from the scanner/entropy start paths + camera_engine_start),
+// so their implementations take the LVGL lock themselves to serialize against the pump.
 #ifndef SS_CAMERA_PREVIEW_SINK_H
 #define SS_CAMERA_PREVIEW_SINK_H
 

@@ -181,6 +181,7 @@ static PyObject *build_screen_required_cfg(PyObject *args, const char *name, scr
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         std::string cfg_json = py_cfg_to_json(cfg);
         fn((void *)cfg_json.c_str());
         s_last_path = "compiled";
@@ -206,6 +207,7 @@ static PyObject *build_screen_optional_cfg(PyObject *args, const char *name, scr
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         if (cfg && cfg != Py_None) {
             std::string cfg_json = py_cfg_to_json(cfg);
             fn((void *)cfg_json.c_str());
@@ -540,6 +542,7 @@ PyObject *py_button_list_screen(PyObject *self, PyObject *args) {
     try {
         validate_button_list_cfg(cfg);
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
 
         std::string cfg_json = py_cfg_to_json(cfg);
         button_list_screen((void *)cfg_json.c_str());
@@ -576,6 +579,7 @@ PyObject *py_settings_locale_picker_screen(PyObject *self, PyObject *args) {
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
 
         // Point the picker's endonym-image provider at the filesystem pack store —
         // the exact seam ss_load_locale uses. A function-local static ctx outlives
@@ -612,6 +616,7 @@ PyObject *py_screensaver_screen(PyObject *self, PyObject *args) {
     (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         screensaver_screen(NULL);
         s_last_path = "compiled";
     } catch (const std::exception &e) {
@@ -654,6 +659,7 @@ PyObject *py_qr_display_set_frame(PyObject *self, PyObject *args) {
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         qr_display_set_frame((const void *)data, static_cast<size_t>(len));
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -669,6 +675,7 @@ PyObject *py_qr_display_set_frame(PyObject *self, PyObject *args) {
 PyObject *py_qr_display_is_tip_active(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
+    LvglLockGuard _lvgl_guard;
     if (qr_display_is_tip_active()) {
         Py_RETURN_TRUE;
     }
@@ -697,6 +704,7 @@ PyObject *py_io_test_set_capture_state(PyObject *self, PyObject *args) {
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         io_test_set_capture_state((io_test_capture_state_t)state);
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -717,6 +725,7 @@ PyObject *py_io_test_get_camera_plane_dims(PyObject *self, PyObject *args) {
     int width = 0, height = 0;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         io_test_get_camera_plane_dims(&width, &height);
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
@@ -742,6 +751,7 @@ PyObject *py_io_test_blit_camera(PyObject *self, PyObject *args) {
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         io_test_blit_camera(reinterpret_cast<const uint8_t *>(view.buf),
                             static_cast<size_t>(view.len));
     } catch (const std::exception &e) {
@@ -771,6 +781,7 @@ PyObject *py_seed_address_verification_set_progress(PyObject *self, PyObject *ar
 
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         seed_address_verification_set_progress(text);
     } catch (const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());

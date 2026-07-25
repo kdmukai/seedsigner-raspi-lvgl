@@ -102,6 +102,7 @@ static PyMethodDef methods[] = {
     {"camera_preview_close", py_camera_preview_close, METH_NOARGS, "End the camera-preview session: free the overlay handle + sink buffer. Call before loading the next screen. Idempotent."},
     {"io_test_camera_start", py_io_test_camera_start, METH_NOARGS, "io_test_camera_start(): begin feeding the active io_test_screen's camera plane from the native engine (KEY1 grab). The app pumps its capturing hold, then calls io_test_camera_stop() to freeze the last frame. Raises OSError(code,msg) on camera bring-up failure; RuntimeError if no io_test_screen is active."},
     {"io_test_camera_stop", py_io_test_camera_stop, METH_NOARGS, "io_test_camera_stop(): stop the engine (last frame stays frozen in the io_test plane) + clear the grab redirect. Idempotent."},
+    {"io_test_camera_frame_ready", py_io_test_camera_frame_ready, METH_NOARGS, "io_test_camera_frame_ready(): True once the background pump has stashed at least one camera frame during the active io_test grab. Lets the host wait for a confirmed first frame (bounded) before io_test_camera_stop() freezes the plane."},
 
     // --- Native toast overlay (toast.cpp) -------------------------------------
     // A transient bottom banner built on the display's top layer: composites over the
@@ -136,6 +137,11 @@ PyMODINIT_FUNC PyInit_seedsigner_lvgl_screens(void) {
     if (!m) {
         return NULL;
     }
+    // RASPI-5 Phase 2: the background LVGL pump thread (spawned by lvgl_init) is a joinable
+    // std::thread; if the app exits without calling lvgl_shutdown() it would std::terminate
+    // at static destruction. Join it at interpreter finalization as a safety net (idempotent
+    // with an explicit lvgl_shutdown()).
+    Py_AtExit(lvgl_runtime_join_pump_thread);
 #ifdef SS_CAMERA_ENGINE
     // Attach the nested `camera_scanner` (QR) + `camera_entropy` (image-entropy) submodules
     // (native libcamera capture engines; ESP camera_scanner / camera_entropy contracts).

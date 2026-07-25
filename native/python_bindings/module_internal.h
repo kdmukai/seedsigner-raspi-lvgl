@@ -31,9 +31,31 @@
 // Throws std::runtime_error if lvgl_init() has not been called.
 void require_lvgl_runtime();
 bool lvgl_runtime_is_inited();
+
+// LVGL global lock (RASPI-5). LVGL core is not thread-safe; every host->widget-tree
+// call and the pump loop's lv_timer_handler holds this recursive lock so the
+// background pump thread (Phase 2) and the host binding thread serialize. Recursive
+// so a locked mutator may call a helper that re-locks (e.g. clear_screen ->
+// lvgl_clear_to_black -> lvgl_runtime_pump). Strict lock ordering: the pump thread
+// takes ONLY this lock; host bindings hold the GIL then take it — so NEVER acquire
+// the GIL while holding this lock (that is the GIL<->LVGL deadlock the design avoids).
+// Uncontended (a no-op) until Phase 2 spawns the pump thread.
+void lvgl_lock();
+void lvgl_unlock();
+// RAII: lock for the enclosing scope, unlock on every exit path (including throws).
+struct LvglLockGuard {
+    LvglLockGuard() { lvgl_lock(); }
+    ~LvglLockGuard() { lvgl_unlock(); }
+    LvglLockGuard(const LvglLockGuard &) = delete;
+    LvglLockGuard &operator=(const LvglLockGuard &) = delete;
+};
 // Drive lv_timer_handler for duration_ms (sleep_ms between iterations).
 // Returns 0 normally, -1 if a Python exception/signal is pending.
 int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms);
+// Stop + join the RASPI-5 Phase-2 background pump thread. Idempotent. Registered with
+// Py_AtExit at module init so the thread is joined even if the app never calls
+// lvgl_shutdown() (a joinable std::thread would std::terminate at static destruction).
+extern "C" void lvgl_runtime_join_pump_thread(void);
 // Load a fresh all-black screen and pump briefly so it reaches the panel.
 // clean_sys_layer additionally clears lv_layer_sys() overlays first.
 void lvgl_clear_to_black(bool clean_sys_layer);
@@ -42,6 +64,10 @@ void lvgl_clear_to_black(bool clean_sys_layer);
 
 // True when the native ST7789 flush path is initialized and selected.
 bool native_flush_active();
+// Select native flush as the flush mode (RASPI-5 Phase 2 — armed at lvgl_init so the
+// background pump never takes the Python flush path). Gated by s_native.ready, so it only
+// paints once native_display_init has brought up the panel.
+void native_flush_select_native();
 // Native-path flush body: debug logging, optional RGB565 byte swap, SPI blit.
 // Catches and logs its own errors (a failed flush must not kill the pump loop).
 void native_flush_blit(const lv_area_t *area, const uint8_t *px_map, size_t nbytes);
@@ -153,6 +179,7 @@ PyObject *py_camera_preview_close(PyObject *self, PyObject *args);
 // io_test single-frame grab (camera_preview.cpp): start/stop the engine feeding the io_test plane.
 PyObject *py_io_test_camera_start(PyObject *self, PyObject *args);
 PyObject *py_io_test_camera_stop(PyObject *self, PyObject *args);
+PyObject *py_io_test_camera_frame_ready(PyObject *self, PyObject *args);
 // Build the preview screen + overlay (shared by py_camera_preview_screen and the
 // native camera_scanner.start()). Throws std::runtime_error on failure.
 void camera_preview_build_session(const std::string &instructions);

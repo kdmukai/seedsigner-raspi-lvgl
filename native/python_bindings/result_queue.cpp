@@ -1,12 +1,15 @@
 // Host result queue: the seedsigner_lvgl_on_* callbacks (strong overrides of the
 // weak defaults in the screens library) push events here; Python drains them via
-// poll_for_result(). Single-threaded by design — both push and poll happen on the
-// thread that pumps LVGL.
+// poll_for_result(). Push runs on the LVGL pump thread (via widget event handlers
+// inside lv_timer_handler); poll/clear run on the app thread. All three serialize
+// on s_queue_mtx (RASPI-5) — required once the pump runs in its own background
+// thread (Phase 2) so head/tail/count aren't torn across the thread boundary.
 #include "module_internal.h"
 
 #include "seedsigner.h"
 
 #include <cstdio>
+#include <mutex>
 
 #define RESULT_QUEUE_CAP 64
 // 256 bytes accommodates a full BIP39 passphrase (text_entered results carry
@@ -53,8 +56,14 @@ static result_event_t s_queue[RESULT_QUEUE_CAP];
 static unsigned int s_head = 0;
 static unsigned int s_tail = 0;
 static unsigned int s_count = 0;
+// RASPI-5: push (pump thread) vs poll/clear (app thread) mutate head/tail/count
+// across the thread boundary once the background pump runs. A leaf mutex — held
+// only for the short body, never while acquiring another lock — so it adds no
+// lock-ordering constraint. Uncontended (a no-op) until Phase 2 spawns the thread.
+static std::mutex s_queue_mtx;
 
 static void queue_push(result_kind_t kind, int index, const char *label) {
+    std::lock_guard<std::mutex> lock(s_queue_mtx);
     result_event_t ev;
     ev.kind = kind;
     ev.index = index;
@@ -149,6 +158,7 @@ PyObject *py_poll_for_result(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
 
+    std::lock_guard<std::mutex> lock(s_queue_mtx);
     if (s_count == 0) {
         Py_RETURN_NONE;
     }
@@ -163,6 +173,7 @@ PyObject *py_poll_for_result(PyObject *self, PyObject *args) {
 PyObject *py_clear_result_queue(PyObject *self, PyObject *args) {
     (void)self;
     (void)args;
+    std::lock_guard<std::mutex> lock(s_queue_mtx);
     s_head = 0;
     s_tail = 0;
     s_count = 0;

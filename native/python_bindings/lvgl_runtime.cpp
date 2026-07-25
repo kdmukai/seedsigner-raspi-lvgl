@@ -14,11 +14,29 @@
 #include "camera_entropy_engine.h"  // camera_entropy_engine_pump_consume (image-entropy)
 #endif
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
+// RASPI-5 LVGL global lock (see module_internal.h). Recursive so a locked mutator
+// may re-enter another locked path on the same thread. The background pump thread
+// takes ONLY this lock (never the GIL); host bindings hold the GIL then take it.
+static std::recursive_mutex s_lvgl_mtx;
+void lvgl_lock() { s_lvgl_mtx.lock(); }
+void lvgl_unlock() { s_lvgl_mtx.unlock(); }
+
 static bool s_lvgl_inited = false;
+
+// RASPI-5 Phase 2: the background pump thread that unconditionally owns the panel
+// (the ESP taskLVGL model) and its run flag. Spawned by lvgl_init, joined by
+// lvgl_shutdown. s_pump_running gates the thread loop, flips lvgl_pump() to a no-op
+// while the thread owns the panel (host + thread must not double-pump), and bars
+// flush_cb's Python path (a GIL acquire under the LVGL lock would deadlock — §3.1).
+static std::thread s_pump_thread;
+static std::atomic<bool> s_pump_running{false};
+static constexpr unsigned int PUMP_THREAD_SLEEP_MS = 5;  // fixed first-cut cadence (design §5)
 static std::vector<uint8_t> s_buf1;  // RGB565: 2 bytes/pixel, sized at runtime
 static lv_display_t *s_disp = NULL;
 static lv_indev_t *s_input_indev = NULL;
@@ -63,7 +81,13 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 
     if (native_flush_active()) {
         native_flush_blit(area, px_map, nbytes);
-    } else if (s_flush_cb_py != NULL) {
+    } else if (!s_pump_running.load(std::memory_order_acquire) && s_flush_cb_py != NULL) {
+        // Python flush path — legal ONLY while the host drives the pump (no background
+        // thread owns the panel). The pump thread runs GIL-free holding the LVGL lock;
+        // entering Python here would acquire the GIL under the LVGL lock — the AB-BA
+        // deadlock §3.1 forbids. Once the pump thread owns the panel the flush MUST be
+        // native (native_display_init sets it); the Python path is then refused, so a
+        // stale python-mode setting renders nothing rather than deadlocking the pump.
         PyGILState_STATE gil = PyGILState_Ensure();
 
         PyObject *payload = PyBytes_FromStringAndSize(reinterpret_cast<const char *>(px_map), static_cast<Py_ssize_t>(nbytes));
@@ -89,6 +113,38 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     }
 
     lv_display_flush_ready(disp);
+}
+
+// One pump iteration: advance the tick, then (under the LVGL lock) publish the newest
+// camera frame and run the LVGL timer/render/flush + keypad indev read. Shared by the
+// Phase-2 background pump thread and the host-driven fallback loop. The tick update is a
+// single-writer lv_tick_inc left OUTSIDE the lock; the lock wraps the LVGL core work.
+// Runs NO Python and NO signal check under the lock (§3.1/§3.5) — the native flush path
+// is GIL-free, so the pump thread never touches the GIL while holding the LVGL lock.
+static void pump_one_iteration() {
+    lvgl_tick_update();
+    LvglLockGuard _lvgl_guard;
+#ifdef SS_CAMERA_ENGINE
+    // Publish the newest engine-converted camera frame into the preview sink BEFORE
+    // rendering, so this iteration paints it. No-op when no capture session is active.
+    // This is the ONLY place an engine frame reaches LVGL. Scan and entropy engines are
+    // mutually exclusive, so at most one publishes per iteration.
+    camera_engine_pump_consume();
+    camera_entropy_engine_pump_consume();
+#endif
+    lv_timer_handler();
+}
+
+// Background pump thread (RASPI-5 Phase 2, the ESP taskLVGL model). It owns the panel and
+// drives lv_timer_handler continuously, entirely GIL-free: NO Python, NO PyErr/signal
+// check (§3.5 — KeyboardInterrupt is delivered on the app's main thread between
+// poll_for_result() calls, never here). The flush is the native ST7789 path (§3.1);
+// flush_cb refuses the Python flush path while this thread owns the panel.
+static void pump_thread_main() {
+    while (s_pump_running.load(std::memory_order_acquire)) {
+        pump_one_iteration();
+        std::this_thread::sleep_for(std::chrono::milliseconds(PUMP_THREAD_SLEEP_MS));
+    }
 }
 
 static void ensure_lvgl_runtime() {
@@ -128,12 +184,44 @@ static void ensure_lvgl_runtime() {
 
     s_last_tick_ms = now_ms();
     s_lvgl_inited = true;
+
+    // RASPI-5 Phase 2 flip: spawn the background pump thread that unconditionally owns the
+    // panel (mirrors the ESP taskLVGL, created at boot). From here LVGL advances without
+    // Python and the host's lvgl_pump() is a no-op (see lvgl_runtime_pump). Force native
+    // flush as the mode (§4) — the required panel path (§3.1) — so the pump never takes the
+    // Python flush path; flush_cb additionally bars it whenever the thread owns the panel.
+    // If the thread fails to spawn, s_pump_running stays false and the host-driven fallback
+    // pump takes over (Phase-1 behaviour).
+    native_flush_select_native();
+    s_pump_running.store(true, std::memory_order_release);
+    try {
+        s_pump_thread = std::thread(pump_thread_main);
+    } catch (...) {
+        s_pump_running.store(false, std::memory_order_release);
+    }
+}
+
+// Stop + join the background pump thread. Idempotent. extern "C" + exposed so module init
+// can register it with Py_AtExit: if the app exits WITHOUT calling lvgl_shutdown(), the
+// still-joinable std::thread would std::terminate at static destruction (§4). A GIL-free
+// join of a Python-free thread, so it is safe to run during interpreter finalization.
+extern "C" void lvgl_runtime_join_pump_thread(void) {
+    if (s_pump_running.exchange(false, std::memory_order_acq_rel)) {
+        if (s_pump_thread.joinable()) {
+            s_pump_thread.join();
+        }
+    }
 }
 
 static void lvgl_runtime_shutdown() {
     if (!s_lvgl_inited) {
         return;
     }
+
+    // Stop + join the background pump thread BEFORE any LVGL teardown (§4): a thread still
+    // inside lv_timer_handler must never touch a half-freed display. After the join the
+    // pump can no longer run, so the teardown below is single-threaded again.
+    lvgl_runtime_join_pump_thread();
 
 #if LV_USE_LOG
     LV_LOG_USER("lvgl runtime shutdown");
@@ -167,19 +255,20 @@ int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms) {
         return 0;
     }
 
+    // RASPI-5 Phase 2: the background pump thread owns the panel and drives
+    // lv_timer_handler continuously. Host-driven pumping would run lv_timer_handler on
+    // two threads at once, so while the thread runs this is a no-op — the app's poll loop
+    // still calls lvgl_pump(); it simply returns immediately. The loop below is the
+    // single-threaded FALLBACK, reached only if the pump thread failed to spawn: the host
+    // then drives the pump as in Phase 1, signal check included (valid because it runs on
+    // the app's main thread, unlike the pump thread — §3.5).
+    if (s_pump_running.load(std::memory_order_acquire)) {
+        return 0;
+    }
+
     auto start = std::chrono::steady_clock::now();
     while (true) {
-        lvgl_tick_update();
-#ifdef SS_CAMERA_ENGINE
-        // Publish the newest engine-converted camera frame into the preview sink
-        // (under the render lock) BEFORE rendering, so this pump paints it. No-op
-        // when no capture session is active. This is the ONLY place an engine frame
-        // reaches LVGL — invalidate stays on the LVGL locus (spec §4.9). Scan and entropy
-        // engines are mutually exclusive, so at most one publishes per pump.
-        camera_engine_pump_consume();
-        camera_entropy_engine_pump_consume();
-#endif
-        lv_timer_handler();
+        pump_one_iteration();
 
         // Check for exceptions raised inside flush callbacks (e.g.
         // KeyboardInterrupt) or new pending signals (Ctrl+C).
@@ -198,13 +287,19 @@ int lvgl_runtime_pump(unsigned int duration_ms, unsigned int sleep_ms) {
 }
 
 void lvgl_clear_to_black(bool clean_sys_layer) {
-    if (clean_sys_layer) {
-        lv_obj_clean(lv_layer_sys());
+    {
+        // Serialize the widget-tree build against the pump thread; release before
+        // pumping (lvgl_runtime_pump takes the lock itself, per iteration). This
+        // guard also covers py_clear_screen, whose only LVGL access is via here.
+        LvglLockGuard _lvgl_guard;
+        if (clean_sys_layer) {
+            lv_obj_clean(lv_layer_sys());
+        }
+        lv_obj_t *scr = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_scr_load(scr);
     }
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_scr_load(scr);
     lvgl_runtime_pump(50, 5);
 }
 
@@ -259,6 +354,10 @@ PyObject *py_set_resolution(PyObject *self, PyObject *args, PyObject *kwargs) {
         Py_RETURN_NONE;  // already at requested resolution
     }
 
+    // Serialize the whole display teardown+recreate against the pump thread — this
+    // deletes and rebuilds the display and every screen (the sharpest call to lock).
+    LvglLockGuard _lvgl_guard;
+
     // Update the active display profile (aborts if no profile matches).
     set_display(width, height);
 
@@ -310,6 +409,7 @@ PyObject *py_display_size(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
+    LvglLockGuard _lvgl_guard;
     const DisplayProfile &p = active_profile();
     return Py_BuildValue("(ii)", p.width, p.height);
 }
@@ -360,6 +460,7 @@ PyObject *py_save_screen(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         s_saved_screen = lv_scr_act();
 
         // Save the current indev group.
@@ -383,6 +484,7 @@ PyObject *py_restore_screen(PyObject *self, PyObject *args) {
     (void)self; (void)args;
     try {
         require_lvgl_runtime();
+        LvglLockGuard _lvgl_guard;
         if (!s_saved_screen) {
             Py_RETURN_NONE;  // nothing saved — no-op
         }
@@ -442,6 +544,9 @@ PyObject *py_set_screensaver_timeout(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "I", &ms)) {
         return NULL;
     }
+    // A 0 timeout dismisses an active screensaver (loads/deletes screens), so this can
+    // touch LVGL — serialize against the pump thread.
+    LvglLockGuard _lvgl_guard;
     overlay_manager_set_screensaver_timeout(static_cast<uint32_t>(ms));
     Py_RETURN_NONE;
 }
@@ -471,6 +576,7 @@ PyObject *py_get_inactive_time_ms(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
         return NULL;
     }
+    LvglLockGuard _lvgl_guard;
     uint32_t ms = lv_display_get_inactive_time(s_disp);
     return PyLong_FromUnsignedLong(static_cast<unsigned long>(ms));
 }
