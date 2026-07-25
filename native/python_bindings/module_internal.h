@@ -179,6 +179,7 @@ PyObject *py_camera_preview_close(PyObject *self, PyObject *args);
 // io_test single-frame grab (camera_preview.cpp): start/stop the engine feeding the io_test plane.
 PyObject *py_io_test_camera_start(PyObject *self, PyObject *args);
 PyObject *py_io_test_camera_stop(PyObject *self, PyObject *args);
+PyObject *py_io_test_camera_frame_ready(PyObject *self, PyObject *args);
 // Build the preview screen + overlay (shared by py_camera_preview_screen and the
 // native camera_scanner.start()). Throws std::runtime_error on failure.
 void camera_preview_build_session(const std::string &instructions);

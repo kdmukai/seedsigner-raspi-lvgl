@@ -487,6 +487,27 @@ PyObject *py_io_test_camera_stop(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+// io_test_camera_frame_ready() -> bool
+// True once the background pump has stashed at least one frame during the active grab
+// (blit_rgb565 above). The pump feeds frames asynchronously and the libcamera cold-start
+// (engine start -> first delivered frame) can exceed a second on the Pi Zero, so the host
+// polls this to wait for a confirmed first frame before io_test_camera_stop() freezes the
+// plane. Read under the LVGL lock so it serializes against the pump thread's stash write
+// (blit_rgb565 runs under that lock).
+PyObject *py_io_test_camera_frame_ready(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    bool ready;
+    {
+        LvglLockGuard _lvgl_guard;
+        ready = !s_io_test_last_frame.empty();
+    }
+    if (ready) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
 // --- Frame push -------------------------------------------------------------
 // camera_preview_set_frame(frame: bytes) -> None
 // frame is LVGL-native RGB565, exactly w*h*2 bytes (see the FRAME FORMAT CONTRACT
