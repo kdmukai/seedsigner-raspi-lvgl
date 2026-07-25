@@ -197,6 +197,15 @@ its whole purpose is PIL↔LVGL panel arbitration — so RASPI-5 *enables* APP-1
 removal stays coupled to the wider PIL sunset. (App anchor is `lvgl_screen_runner.py:904-909` and the
 master TODO, **not** the adjacent `896-898` screensaver-flag TODO, which is a separate screens-repo item.)
 
+**Native panel bring-up (Pi flush path).** The forced native flush paints only once the native ST7789
+backend is up, so `ensure_lvgl_runtime`'s CPython branch calls `native_display_init()` before
+`lvgl_init()`: it opens the SPI, claims the DC/RST/BL + input gpiochip lines, and runs the panel init
+sequence (and calls `native_input_init()` itself). On ESP the `init()` entry brings the panel up
+instead. The Python `Renderer` also instantiates its ST7789 driver for the canvas dimensions; its
+`RPi.GPIO`/gpiomem + spidev claims coexist with the native gpiochip owner (only the native side drives
+the panel), and retiring that driver is part of the wider Python-display-pipeline removal. Detail:
+`docs/knowledge/pi-native-flush-requires-display-init.md`.
+
 ## 8. Open decisions (for whoever picks this up)
 
 1. **Result-queue synchronization:** plain `std::mutex` (recommended — simplest, correct) vs.
