@@ -188,6 +188,35 @@ static uint8_t native_madctl_for_resolution() {
     return madctl;
 }
 
+static void native_display_fill_window_black(int x1, int y1, int x2, int y2) {
+    native_set_window(x1, y1, x2, y2);
+    const size_t total_bytes =
+        static_cast<size_t>(x2 - x1 + 1) * static_cast<size_t>(y2 - y1 + 1) * 2;
+    static const uint8_t kBlack[4096] = {0};  // RGB565 0x0000, byte-order agnostic
+    size_t remaining = total_bytes;
+    while (remaining > 0) {
+        size_t n = remaining < sizeof(kBlack) ? remaining : sizeof(kBlack);
+        native_data_buf(kBlack, n);
+        remaining -= n;
+    }
+}
+
+static void native_display_clear_full_extent() {
+    // Blank the controller's entire GRAM, sized to the ST7789's fixed 240x320
+    // maximum (a superset of every bonded glass) rather than the logical
+    // resolution. This makes uninitialized power-on memory outside the logical
+    // area — e.g. the right strip when a 320x240 panel runs at the default
+    // 240x240 — show black instead of garbage, without needing to know the real
+    // panel size (an ST7789 cannot report it; see
+    // docs/knowledge/st7789-resolution-not-detectable.md).
+    //
+    // Cover both MADCTL orientations: whichever is active, one window matches the
+    // valid extent exactly (fully clearing the glass) and the other over-addresses
+    // one axis, which the controller drops.
+    native_display_fill_window_black(0, 0, 319, 239);  // landscape (MADCTL 0x60)
+    native_display_fill_window_black(0, 0, 239, 319);  // portrait  (MADCTL 0x70)
+}
+
 static void native_display_init_sequence() {
     // Full ST7789 initialization sequence (matches SeedSigner st7789_mpy.py).
     native_cmd(0x11);                                           // SLPOUT: exit sleep
@@ -229,6 +258,7 @@ static void native_display_init_sequence() {
     native_cmd(0x21);                                           // INVON: display inversion
     native_cmd(0x36);                                           // MADCTL: rotation/color order
     native_data_byte(native_madctl_for_resolution());
+    native_display_clear_full_extent();                         // blank GRAM before output is enabled
     native_cmd(0x29);                                           // DISPON: display on
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
 }
