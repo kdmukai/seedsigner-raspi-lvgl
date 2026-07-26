@@ -125,9 +125,20 @@ void camera_preview_build_session(const std::string &instructions) {
 
         const int32_t w = lv_display_get_horizontal_resolution(NULL);
         const int32_t h = lv_display_get_vertical_resolution(NULL);
-        const size_t  buf_size = static_cast<size_t>(w) * static_cast<size_t>(h) * 2;
+        // The live preview is a CENTERED SQUARE of the short display dimension. On a square
+        // panel (Pi Zero 240x240) the square == the whole screen and sq_x/sq_y are 0 —
+        // byte-identical to before. On a wide panel (SeedSigner+ 320x240) the square is
+        // centered with static black L/R pillars that the portable overlay paints via its
+        // gutter-blanking (keyed off square_x/w). Keeping the sink SQUARE also keeps the
+        // engine's convert square (no non-square transpose), so a scan costs the same
+        // per-frame on both panels — the square-crop is the SeedSigner+ perf lever (RASPI-7).
+        const int32_t side = w < h ? w : h;
+        const int32_t sq_x = (w - side) / 2;
+        const int32_t sq_y = (h - side) / 2;
+        const size_t  buf_size = static_cast<size_t>(side) * static_cast<size_t>(side) * 2;
 
-        // Bare black screen (chrome-free: no top-nav scaffold).
+        // Bare black screen (chrome-free: no top-nav scaffold). Its black background is what
+        // shows through the pillars on a wide panel (the overlay's gutter fills sit on top).
         lv_obj_t *scr = lv_obj_create(NULL);
         lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -136,7 +147,7 @@ void camera_preview_build_session(const std::string &instructions) {
         lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
         lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-        // Pixel sink: one full-screen RGB565 lv_image the host memcpy's frames into.
+        // Pixel sink: one centered-square RGB565 lv_image the host memcpy's frames into.
         // The dsc.data pointer stays STABLE for the whole session (buffer sized once,
         // never resized on set_frame) so LVGL's cached decode aliases our buffer and
         // a memcpy + invalidate updates what's drawn — the ESP image-widget contract.
@@ -147,31 +158,31 @@ void camera_preview_build_session(const std::string &instructions) {
         lv_memzero(&s_cam_dsc, sizeof(s_cam_dsc));
         s_cam_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
         s_cam_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
-        s_cam_dsc.header.w      = w;
-        s_cam_dsc.header.h      = h;
-        s_cam_dsc.header.stride = static_cast<uint32_t>(w) * 2;
+        s_cam_dsc.header.w      = side;
+        s_cam_dsc.header.h      = side;
+        s_cam_dsc.header.stride = static_cast<uint32_t>(side) * 2;
         s_cam_dsc.data_size     = static_cast<uint32_t>(buf_size);
         s_cam_dsc.data          = s_cam_data;
 
         s_cam_img = lv_image_create(scr);
-        lv_obj_set_size(s_cam_img, w, h);
-        lv_obj_set_pos(s_cam_img, 0, 0);
+        lv_obj_set_size(s_cam_img, side, side);
+        lv_obj_set_pos(s_cam_img, sq_x, sq_y);
         lv_image_set_src(s_cam_img, &s_cam_dsc);
         lv_obj_remove_flag(s_cam_img,
                            (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
 
-        // Overlay chrome ON TOP (created after the image so it draws above it). On the
-        // Pi (short dim <= 240) the preview square fills the whole display: square ==
-        // screen, so the overlay adds no gutter fills. Start on the back-affordance
-        // state (instruction text shown); the first set_progress() raises the bar
-        // (mirrors Python ScanScreen: instructions first, progress bar once decoding).
+        // Overlay chrome ON TOP (created after the image so it draws above it). It reads the
+        // square rect below to paint the gutter pillars (wide panel only) and center all
+        // chrome over the square. Start on the back-affordance state (instruction text
+        // shown); the first set_progress() raises the bar (mirrors Python ScanScreen:
+        // instructions first, progress bar once decoding).
         camera_preview_overlay_spec_t spec;
         lv_memzero(&spec, sizeof(spec));
         spec.instructions_text = instructions.empty() ? nullptr : instructions.c_str();
-        spec.square_x = 0;
-        spec.square_y = 0;
-        spec.square_w = w;
-        spec.square_h = h;
+        spec.square_x = sq_x;
+        spec.square_y = sq_y;
+        spec.square_w = side;
+        spec.square_h = side;
         spec.scanning_active  = false;
         spec.progress_percent = 0;
         spec.frame_status     = CAMERA_OVERLAY_FRAME_NONE;
@@ -222,7 +233,14 @@ void camera_entropy_build_session(const std::string &preview_instructions,
 
     const int32_t w = lv_display_get_horizontal_resolution(NULL);
     const int32_t h = lv_display_get_vertical_resolution(NULL);
-    const size_t  buf_size = static_cast<size_t>(w) * static_cast<size_t>(h) * 2;
+    // Centered short-dim square sink; on a wide panel the flanking columns are static black
+    // pillars the overlay paints. Mirrors camera_preview_build_session — see the rationale
+    // there (square sink keeps the engine convert square, no non-square transpose). The
+    // CONFIRM review image is separately display-sized (fills the whole panel by design).
+    const int32_t side = w < h ? w : h;
+    const int32_t sq_x = (w - side) / 2;
+    const int32_t sq_y = (h - side) / 2;
+    const size_t  buf_size = static_cast<size_t>(side) * static_cast<size_t>(side) * 2;
 
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
@@ -239,27 +257,28 @@ void camera_entropy_build_session(const std::string &preview_instructions,
     lv_memzero(&s_cam_dsc, sizeof(s_cam_dsc));
     s_cam_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
     s_cam_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
-    s_cam_dsc.header.w      = w;
-    s_cam_dsc.header.h      = h;
-    s_cam_dsc.header.stride = static_cast<uint32_t>(w) * 2;
+    s_cam_dsc.header.w      = side;
+    s_cam_dsc.header.h      = side;
+    s_cam_dsc.header.stride = static_cast<uint32_t>(side) * 2;
     s_cam_dsc.data_size     = static_cast<uint32_t>(buf_size);
     s_cam_dsc.data          = s_cam_data;
 
     s_cam_img = lv_image_create(scr);
-    lv_obj_set_size(s_cam_img, w, h);
-    lv_obj_set_pos(s_cam_img, 0, 0);
+    lv_obj_set_size(s_cam_img, side, side);
+    lv_obj_set_pos(s_cam_img, sq_x, sq_y);
     lv_image_set_src(s_cam_img, &s_cam_dsc);
     lv_obj_remove_flag(s_cam_img,
                        (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
 
-    // Entropy overlay ON TOP (created after the image so it draws above it). On the Pi the
-    // preview square fills the whole display (square == screen). PREVIEW phase to start.
+    // Entropy overlay ON TOP (created after the image so it draws above it). It reads the
+    // square rect below to paint the gutter pillars (wide panel) and center chrome over the
+    // square. PREVIEW phase to start.
     camera_entropy_overlay_spec_t spec;
     lv_memzero(&spec, sizeof(spec));
-    spec.square_x = 0;
-    spec.square_y = 0;
-    spec.square_w = w;
-    spec.square_h = h;
+    spec.square_x = sq_x;
+    spec.square_y = sq_y;
+    spec.square_w = side;
+    spec.square_h = side;
     spec.preview_instructions = preview_instructions.empty() ? nullptr : preview_instructions.c_str();
     spec.confirm_instructions = confirm_instructions.empty() ? nullptr : confirm_instructions.c_str();
     spec.capturing_text       = capturing_text.empty() ? nullptr : capturing_text.c_str();
