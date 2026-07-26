@@ -173,8 +173,18 @@ void convert_yuv420_rgb565(const uint8_t *buf, int src_w, int src_h,
 
 // --- blit worker ------------------------------------------------------------
 void blit_worker() {
+    // A quarter-turn (90/270) TRANSPOSES the converted frame: the output is disp_h wide x
+    // disp_w tall, so the write stride (dst_w) must be the POST-rotation width, not disp_w.
+    // On a non-square sink, passing disp_w strides past the buffer end every frame — a heap
+    // overflow on this worker thread. The pixel *product* is rotation-invariant, so on a
+    // square sink (every Pi Zero, and the SeedSigner+ centered-square preview) this is byte-
+    // identical to before. Mirrors the entropy still path. See nonsquare-panel-preview-rotation-todo.md.
+    const bool swap_axes = (g->rotate == 90 || g->rotate == 270);
+    const int  out_w = swap_axes ? g->disp_h : g->disp_w;
+    const int  out_h = swap_axes ? g->disp_w : g->disp_h;
+
     std::vector<uint8_t> local_in(g->disp_total);
-    std::vector<uint8_t> work(static_cast<size_t>(g->disp_w) * g->disp_h * 2);
+    std::vector<uint8_t> work(static_cast<size_t>(out_w) * out_h * 2);
     uint64_t last_gen = 0;
 
     while (g->running.load(std::memory_order_acquire)) {
@@ -193,7 +203,7 @@ void blit_worker() {
         convert_yuv420_rgb565(local_in.data(), g->disp_w, g->disp_h,
                               g->disp_ystride, g->disp_uvstride,
                               g->disp_u_off, g->disp_v_off, g->rotate,
-                              reinterpret_cast<uint16_t *>(work.data()), g->disp_w);
+                              reinterpret_cast<uint16_t *>(work.data()), out_w);
 
         {
             std::lock_guard<std::mutex> lk(g->out_mtx);
@@ -425,6 +435,8 @@ int camera_engine_start() {
         g->disp_v_off  = planes[2].offset - base;
         g->disp_uvstride = static_cast<int>(planes[1].length / (g->disp_h / 2));
         g->scratch.assign(g->disp_total, 0);
+        // Swap-partner of blit_worker's `work`; sized to the post-rotation extent, which is
+        // disp_w*disp_h (the pixel product is rotation-invariant) — the swap keeps sizes equal.
         g->ready_buf.assign(static_cast<size_t>(g->disp_w) * g->disp_h * 2, 0);
     }
     {
