@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import glob
 import os
+import shlex
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext as _build_ext
@@ -153,17 +154,25 @@ extra_link_args: list[str] = []
 # own portability + cross-build link args.
 uur_link_args: list[str] = []
 extra_compile_args: list[str] = ["-std=c++17"]
-if armv6_force:
-    # Codegen flags come from versions.lock.toml via docker/build_steps.sh
-    # (ARMV6_* env); the fallbacks only serve a bare ARMV6_FORCE=1 invocation
-    # outside the locked build.
-    extra_compile_args.extend([
-        f"-march={os.environ.get('ARMV6_ARCH', 'armv6zk')}",
-        f"-mtune={os.environ.get('ARMV6_TUNE', 'arm1176jzf-s')}",
-        "-marm",
-        f"-mfpu={os.environ.get('ARMV6_FPU', 'vfp')}",
-        f"-mfloat-abi={os.environ.get('ARMV6_FLOAT_ABI', 'hard')}",
-    ])
+# Per-target codegen. TARGET_CFLAGS (set by docker/build_steps.sh from
+# versions.lock.<profile>.toml's [toolchain].cflags) is the general path, applied
+# verbatim -- e.g. the pi02w A53+NEON profile. When it is unset, the ARMV6_FORCE
+# path supplies the armv6 flags (unchanged), so the default build is byte-identical.
+target_cflags = os.environ.get("TARGET_CFLAGS", "").strip()
+if target_cflags or armv6_force:
+    if target_cflags:
+        extra_compile_args.extend(shlex.split(target_cflags))
+    else:
+        # Codegen flags come from versions.lock.toml via docker/build_steps.sh
+        # (ARMV6_* env); the fallbacks only serve a bare ARMV6_FORCE=1 invocation
+        # outside the locked build.
+        extra_compile_args.extend([
+            f"-march={os.environ.get('ARMV6_ARCH', 'armv6zk')}",
+            f"-mtune={os.environ.get('ARMV6_TUNE', 'arm1176jzf-s')}",
+            "-marm",
+            f"-mfpu={os.environ.get('ARMV6_FPU', 'vfp')}",
+            f"-mfloat-abi={os.environ.get('ARMV6_FLOAT_ABI', 'hard')}",
+        ])
     # uUR is pure C (no libstdc++); static libgcc keeps it self-contained on the
     # device regardless of the main extension's camera/no-camera linkage.
     uur_link_args.append("-static-libgcc")

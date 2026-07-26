@@ -114,20 +114,31 @@ print('[build] ABI gate OK')
 PY
 
 # --- Toolchain ----------------------------------------------------------------
-# Codegen flags from the lock (the buildroot toolchain already defaults to this
-# target; passing them keeps versions.lock.toml the single source of truth).
-read -r ARCH TUNE FPU FLOAT_ABI LOCK_MAX_GLIBC LOCK_MAX_GLIBCXX <<< "$("${PYTHON_BIN}" - <<'PY' "${LOCK_FILE}"
-import sys, tomllib
-with open(sys.argv[1], 'rb') as f:
-    lock = tomllib.load(f)
+# Codegen from the lock (the buildroot toolchain already defaults to this target;
+# passing it keeps versions.lock.<profile>.toml the single source of truth).
+# [toolchain].cflags (an explicit list, e.g. pi02w's A53+NEON) is the general path,
+# applied verbatim by setup.py via TARGET_CFLAGS; when it is absent the armv6
+# ARMV6_* env supplies the flags (byte-identical to before). CPU_ARCH_REGEX is the
+# ELF Tag_CPU_arch the artifact gate then requires this build to emit.
+eval "$("${PYTHON_BIN}" - <<'PY' "${LOCK_FILE}"
+import sys, tomllib, shlex
+lock = tomllib.load(open(sys.argv[1], 'rb'))
 tc = lock['toolchain']; abi = lock.get('target_abi', {})
-print(tc['arch'], tc['tune'], tc['fpu'], tc['float_abi'],
-      abi.get('max_glibc', 'GLIBC_2.28'), abi.get('max_glibcxx', 'GLIBCXX_3.4.21'))
+def q(k, v): print(f"{k}={shlex.quote(str(v))}")
+q('ARCH', tc['arch']); q('TUNE', tc['tune']); q('FPU', tc['fpu']); q('FLOAT_ABI', tc['float_abi'])
+q('LOCK_MAX_GLIBC', abi.get('max_glibc', 'GLIBC_2.28'))
+q('LOCK_MAX_GLIBCXX', abi.get('max_glibcxx', 'GLIBCXX_3.4.21'))
+q('TARGET_CFLAGS', ' '.join(tc['cflags']) if tc.get('cflags') else '')
+q('CPU_ARCH_REGEX', tc.get('cpu_arch_regex', 'v6|v6KZ'))
 PY
 )"
 
-export ARMV6_FORCE=1
-export ARMV6_ARCH="${ARCH}" ARMV6_TUNE="${TUNE}" ARMV6_FPU="${FPU}" ARMV6_FLOAT_ABI="${FLOAT_ABI}"
+if [[ -n "${TARGET_CFLAGS}" ]]; then
+  export TARGET_CFLAGS                 # setup.py applies these verbatim
+else
+  export ARMV6_FORCE=1
+  export ARMV6_ARCH="${ARCH}" ARMV6_TUNE="${TUNE}" ARMV6_FPU="${FPU}" ARMV6_FLOAT_ABI="${FLOAT_ABI}"
+fi
 
 # ccache wraps the CROSS compiler (not host gcc) so repeat CI runs reuse objects.
 # Assign unconditionally -- a "${CC:-...}" default would silently lose to an
@@ -153,8 +164,12 @@ echo "[build] compiler CC=${CC} CXX=${CXX}"
 
 # --- Build --------------------------------------------------------------------
 # The package dir (pyproject: package-dir {"" = "src"}) holds only the built,
-# git-ignored .so, so a fresh checkout has no src/ at all.
-mkdir -p "${ROOT_DIR}/src"
+# git-ignored .so, so a fresh checkout has no src/ at all. build_ext --inplace
+# writes into src/; a non-armv6 profile's .so has the SAME SOABI/filename, so it
+# is moved into src/<profile>/ after the gates (below) to coexist with armv6's.
+if [[ "${TARGET_PROFILE:-armv6}" == "armv6" ]]; then OUT_DIR="${ROOT_DIR}/src"; else OUT_DIR="${ROOT_DIR}/src/${TARGET_PROFILE}"; fi
+mkdir -p "${ROOT_DIR}/src" "${OUT_DIR}"
+rm -f "${OUT_DIR}"/seedsigner_lvgl_screens*.so "${OUT_DIR}"/uUR*.so
 rm -f "${ROOT_DIR}"/src/seedsigner_lvgl_screens*.so "${ROOT_DIR}"/src/uUR*.so
 
 BUILD_DIR="${BUILD_DIR:-/tmp/build}"
@@ -209,8 +224,8 @@ PY
     local READELF_OUT
     READELF_OUT="$(readelf -A "${ART}")"
     echo "${READELF_OUT}"
-    if ! echo "${READELF_OUT}" | grep -Eq 'Tag_CPU_arch: v6|Tag_CPU_arch: v6KZ'; then
-      echo "ERROR: ${label} artifact CPU arch attribute is not ARMv6-compatible" >&2
+    if ! echo "${READELF_OUT}" | grep -Eq "Tag_CPU_arch: (${CPU_ARCH_REGEX})"; then
+      echo "ERROR: ${label} artifact CPU arch (Tag_CPU_arch) does not match required '${CPU_ARCH_REGEX}'" >&2
       exit 7
     fi
   fi
@@ -240,14 +255,21 @@ PY
   fi
 }
 
-MAIN_ART="$(find "${ROOT_DIR}" -maxdepth 2 -type f -name 'seedsigner_lvgl_screens*.so' | sort | tail -n1 || true)"
+# Move the freshly built .so(s) from src/ (build_ext --inplace target) into the
+# profile output dir (no-op for armv6), then verify them there.
+if [[ "${OUT_DIR}" != "${ROOT_DIR}/src" ]]; then
+  mv "${ROOT_DIR}"/src/seedsigner_lvgl_screens*.so "${OUT_DIR}/"
+  mv "${ROOT_DIR}"/src/uUR*.so "${OUT_DIR}/"
+fi
+
+MAIN_ART="$(find "${OUT_DIR}" -maxdepth 1 -type f -name 'seedsigner_lvgl_screens*.so' | sort | tail -n1 || true)"
 if [[ -z "${MAIN_ART}" ]]; then
   echo "ERROR: no built seedsigner_lvgl_screens extension artifact found" >&2
   exit 6
 fi
 verify_artifact "${MAIN_ART}" "seedsigner_lvgl_screens"
 
-UUR_ART="$(find "${ROOT_DIR}" -maxdepth 2 -type f -name 'uUR*.so' | sort | tail -n1 || true)"
+UUR_ART="$(find "${OUT_DIR}" -maxdepth 1 -type f -name 'uUR*.so' | sort | tail -n1 || true)"
 if [[ -z "${UUR_ART}" ]]; then
   echo "ERROR: no built uUR extension artifact found" >&2
   exit 6
