@@ -66,11 +66,13 @@ Usage: $(basename "$0") [SSH_TARGET] [options]
                          (live/uncommitted screens source). Implies --build. Must
                          live under the dev/ tree (WS_ROOT). Overrides SS_SCREENS_DIR.
       --build            (re)build the .so via run_build.sh before deploying.
+  -p, --profile PROFILE  target build profile: armv6 (default, Pi Zero/ARM1176) or
+                         pi02w (Pi Zero 2 W / A53). Selects the SDK + src/<profile>/.
   -h, --help             show this help.
 Anything not given on the CLI falls back to env vars, then .env (see .env.example).
 EOF
 }
-_cli_device=""; _cli_app_dir=""; _cli_screens_dir=""; _cli_build=0
+_cli_device=""; _cli_app_dir=""; _cli_screens_dir=""; _cli_build=0; _cli_profile=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)    _ss_usage; exit 0 ;;
@@ -78,6 +80,7 @@ while [ "$#" -gt 0 ]; do
     -a|--app-dir) _cli_app_dir="${2:?--app-dir needs a value}"; shift 2 ;;
     -s|--screens-dir) _cli_screens_dir="${2:?--screens-dir needs a value}"; shift 2 ;;
     --build)      _cli_build=1; shift ;;
+    -p|--profile) _cli_profile="${2:?--profile needs a value}"; shift 2 ;;
     --)           shift; break ;;
     -*)           echo "Unknown option: $1" >&2; _ss_usage; exit 2 ;;
     *)            if [ -z "$_cli_device" ]; then _cli_device="$1"; shift;
@@ -91,7 +94,8 @@ fi
 if [ -n "$_cli_app_dir" ]; then export SS_APP_DIR="$_cli_app_dir"; fi
 if [ -n "$_cli_screens_dir" ]; then export SS_SCREENS_DIR="$_cli_screens_dir"; fi
 if [ "$_cli_build" = 1 ]; then export SS_BUILD=1; fi
-unset _cli_device _cli_app_dir _cli_screens_dir _cli_build
+if [ -n "$_cli_profile" ]; then export SS_PROFILE="$_cli_profile"; fi
+unset _cli_device _cli_app_dir _cli_screens_dir _cli_build _cli_profile
 
 # Load .env (repo root) if present; process env still overrides it.
 #
@@ -113,28 +117,32 @@ fi
 : "${SS_APP_DIR:?set SS_APP_DIR — the seedsigner app checkout root — see .env.example}"
 
 # --- Optional (re)build before deploy ----------------------------------------
+SS_PROFILE="${SS_PROFILE:-armv6}"    # armv6 (Pi Zero/ARM1176) | pi02w (Zero 2 W/A53)
 # A screens source dir (SS_SCREENS_DIR / --screens-dir) or SS_BUILD=1 / --build
 # triggers a fresh build via run_build.sh, so a test deploy can pick up LIVE,
 # uncommitted seedsigner-lvgl-screens changes without touching the pinned submodule.
 # run_build.sh maps a HOST screens dir (must live under the dev/ tree) to the mounted
 # container path. Without either, deploy uses the newest existing .so (unchanged).
 if [ -n "${SS_SCREENS_DIR:-}" ] || [ "${SS_BUILD:-0}" = 1 ]; then
-  echo "==> [build] run_build.sh${SS_SCREENS_DIR:+  (screens source: $SS_SCREENS_DIR)}"
+  echo "==> [build] run_build.sh (profile: $SS_PROFILE)${SS_SCREENS_DIR:+  (screens source: $SS_SCREENS_DIR)}"
   if [ -n "${SS_SCREENS_DIR:-}" ]; then
-    SS_SCREENS_SRC="$SS_SCREENS_DIR" "$REPO_ROOT/run_build.sh"
+    TARGET_PROFILE="$SS_PROFILE" SS_SCREENS_SRC="$SS_SCREENS_DIR" "$REPO_ROOT/run_build.sh"
   else
-    "$REPO_ROOT/run_build.sh"
+    TARGET_PROFILE="$SS_PROFILE" "$REPO_ROOT/run_build.sh"
   fi
 fi
 
 # The .so built by this repo (default: newest in src/). The `|| true` keeps a
 # missing .so from killing the script here via pipefail+set -e — the preflight
 # below owns that error and prints an actionable message.
-SS_SO_PATH="${SS_SO_PATH:-$(ls -1t "$REPO_ROOT"/src/seedsigner_lvgl_screens*.so 2>/dev/null | head -n1 || true)}"
+# Per-profile .so dir: armv6 at src/, other profiles at src/<profile>/ (same SOABI
+# -> same filename, kept apart by directory; see docker/build_steps.sh).
+if [ "$SS_PROFILE" = armv6 ]; then _SO_DIR="$REPO_ROOT/src"; else _SO_DIR="$REPO_ROOT/src/$SS_PROFILE"; fi
+SS_SO_PATH="${SS_SO_PATH:-$(ls -1t "$_SO_DIR"/seedsigner_lvgl_screens*.so 2>/dev/null | head -n1 || true)}"
 # Native cUR (BC-UR) `uUR` extension, if this build produced one. Optional: an
 # absent uUR.so is a valid deploy — the app's helpers/ur2/decoder.py falls back
 # to the pure-Python decoder when `import uUR` fails.
-SS_UUR_SO_PATH="${SS_UUR_SO_PATH:-$(ls -1t "$REPO_ROOT"/src/uUR*.so 2>/dev/null | head -n1 || true)}"
+SS_UUR_SO_PATH="${SS_UUR_SO_PATH:-$(ls -1t "$_SO_DIR"/uUR*.so 2>/dev/null | head -n1 || true)}"
 # Device-side layout (#114 dev image; override only for an odd device).
 # The app dir is /start.sh's DEV_SRC and the CWD at launch, so the .so co-locates
 # there by default (sys.path[0] import — no PYTHONPATH needed).

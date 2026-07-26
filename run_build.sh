@@ -12,9 +12,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_ROOT="${WS_ROOT:-$(cd "${ROOT_DIR}/.." && pwd)}"
+# Per-target SDK image + versions lock. Both profiles share the SAME OS pin (their
+# sysroots are harvested from the same SeedSigner OS #114 buildroot); only the arch
+# differs. TARGET_PROFILE=armv6 (default, Pi Zero/ARM1176) or pi02w (Pi Zero 2 W/A53).
+TARGET_PROFILE="${TARGET_PROFILE:-armv6}"
+case "${TARGET_PROFILE}" in
+  armv6) _SDK_REPO="sdk-armv6"; _LOCK="versions.lock.toml" ;;
+  pi02w) _SDK_REPO="sdk-pi02w"; _LOCK="versions.lock.pi02w.toml" ;;
+  *) echo "[run-build] ERROR: unknown TARGET_PROFILE '${TARGET_PROFILE}'" >&2; exit 1 ;;
+esac
 # Pinned to the SeedSigner OS release whose sysroot it carries; bumping the OS
 # means rebuilding the SDK and moving this tag in one commit.
-IMAGE_TAG="${IMAGE_TAG:-ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-armv6:ss-os-0.8.0-81-gbfbd791}"
+IMAGE_TAG="${IMAGE_TAG:-ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/${_SDK_REPO}:ss-os-0.8.0-81-gbfbd791}"
 
 # Map host repo path into mounted container workspace deterministically.
 REL_REPO_PATH="$(realpath --relative-to="${WS_ROOT}" "${ROOT_DIR}")"
@@ -51,6 +60,7 @@ exec > >(tee -a "${LOG_FILE}")
 exec 2>&1
 
 echo "[run-build] run_ts=${RUN_TS}"
+echo "[run-build] target_profile=${TARGET_PROFILE} lock=${_LOCK}"
 echo "[run-build] image=${IMAGE_TAG} (native x86 cross-compile)"
 echo "[run-build] container_repo_dir=${CONTAINER_REPO_DIR}"
 echo "[run-build] log_file=${LOG_FILE}"
@@ -67,8 +77,9 @@ docker run --rm \
   -w "${CONTAINER_REPO_DIR}" \
   -e RUN_TS="${RUN_TS}" \
   -e JOBS="${JOBS:-}" \
+  -e TARGET_PROFILE="${TARGET_PROFILE}" \
   -e ABI_JSON="${ABI_JSON:-${CONTAINER_REPO_DIR}/docs/abi/dev-pi-abi.json}" \
-  -e LOCK_FILE="${LOCK_FILE:-${CONTAINER_REPO_DIR}/versions.lock.toml}" \
+  -e LOCK_FILE="${LOCK_FILE:-${CONTAINER_REPO_DIR}/${_LOCK}}" \
   -e SEEDSIGNER_LVGL_SCREENS_DIR="${SEEDSIGNER_LVGL_SCREENS_DIR:-${CONTAINER_REPO_DIR}/sources/seedsigner-lvgl-screens}" \
   -e LVGL_ROOT="${LVGL_ROOT:-${CONTAINER_REPO_DIR}/sources/seedsigner-lvgl-screens/third_party/lvgl}" \
   -e LVGL_PERF_MONITOR="${LVGL_PERF_MONITOR:-0}" \

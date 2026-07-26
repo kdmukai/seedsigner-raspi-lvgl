@@ -1,0 +1,37 @@
+# Pin set for the pi02w (Pi Zero 2 W / Pi 3, Cortex-A53) extension build.
+# Selected by TARGET_PROFILE=pi02w (docker/build_steps.sh, run_build.sh).
+#
+# Same 32-bit armhf tuple (arm-Buildroot-linux-gnueabihf) + Python 3.12 as the
+# armv6 build, so [target_abi] is IDENTICAL -- SOABI, ext_suffix, and the
+# glibc/libstdc++ ceilings all come from the same SeedSigner OS #114 buildroot.
+# The .so therefore has the SAME filename as the armv6 build; they are kept apart
+# by output directory (src/pi02w/), not by name. Only [toolchain] differs: A53 +
+# NEON-VFPv4 codegen instead of ARM1176 + VFP.
+
+[target_abi]
+python_soabi = "cpython-312-arm-linux-gnueabihf"
+python_ext_suffix = ".cpython-312-arm-linux-gnueabihf.so"
+max_glibc = "GLIBC_2.40"
+max_glibcxx = "GLIBCXX_3.4.32"
+
+[toolchain]
+# arch/tune/fpu/float_abi document the target and satisfy build_steps' presence
+# check; `cflags` is the authoritative codegen list, applied verbatim by setup.py.
+# The -mcpu form matches Buildroot's BR2_cortex_a53 + BR2_ARM_FPU_NEON_VFPV4, which
+# the pi02w sysroot toolchain defaults to (verified from the built sysroot:
+# Tag_CPU_arch v8, Tag_FP_arch VFPv4, Advanced SIMD NEON). cpu_arch_regex is the
+# ELF Tag_CPU_arch the artifact gate requires this build to emit.
+arch = "armv8-a"
+tune = "cortex-a53"
+float_abi = "hard"
+fpu = "neon-vfpv4"
+cflags = ["-mcpu=cortex-a53", "-mfpu=neon-vfpv4", "-mfloat-abi=hard"]
+cpu_arch_regex = "v8"
+
+[python]
+# Interpreter the SDK image builds with: buildroot's own host Python, the same
+# 3.12.10 the device runs. Only major.minor (3.12) drives SOABI.
+py312 = "3.12.10"
+
+[build_tools]
+ccache = "recommended"
