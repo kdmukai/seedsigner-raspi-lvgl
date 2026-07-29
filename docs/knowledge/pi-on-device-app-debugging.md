@@ -78,10 +78,64 @@ nobody is consuming them — look at the drive loop, not the camera.
   `native_display_init()`. GPIO lines are exclusive: a second process fails with
   `GPIO_GET_LINEHANDLE_IOCTL(input) failed pin=6 errno=16` (EBUSY). This is easy to misread
   as a bug in the thing being tested.
-- **Reflashing changes the SSH host key**, and `seedsigner.local` and the IP are separate
-  `known_hosts` entries — fixing one leaves the other failing. Verify both present the same
-  fingerprint (`ssh-keyscan -t ed25519 <host> | ssh-keygen -lf -`) before re-accepting.
-- No `timeout` or `pgrep` on the device (busybox); use `ps | grep '[m]ain.py'`.
+- **The SSH host key regenerates on EVERY boot, not just on reflash**, so every power-cycle trips
+  `REMOTE HOST IDENTIFICATION HAS CHANGED` under strict checking (it is not a reflash and not a
+  MITM). Verified by fingerprint across a deliberate reboot, on two different boards.
+
+  The dev image *tries* to prevent this and does not succeed: the rootfs is a RAM-resident
+  initramfs, and `S30devdata` symlinks `/etc/dropbear` -> `/mnt/data/etc/dropbear` so
+  `dropbear -R`'s generated keys land on the persistent data partition. In practice `/etc/dropbear`
+  is still a real directory at runtime and `/mnt/data/etc` never appears. The `/root` bind-mount in
+  the *same* `if` block does work, so the block is running — the dropbear branch specifically is not
+  achieving persistence. Cause unresolved; `ls -ld /etc/dropbear` on a booted board says immediately
+  whether the symlink took.
+
+  Don't chase individual keys; exempt the dev boards once in `~/.ssh/config`. Each board advertises
+  its own name (see the naming bullet below), so the pattern covers the family:
+  ```conf
+  Host seedsigner-*.local 192.168.1.9*
+      User root
+      StrictHostKeyChecking no
+      UserKnownHostsFile /dev/null
+      LogLevel ERROR
+  ```
+  `UserKnownHostsFile /dev/null` keeps the churning keys out of the real `known_hosts` so they
+  never collide again. (Tradeoff: this drops MITM protection — fine for LAN dev boards that
+  regenerate keys by design, not for production hosts.)
+
+  `authorized_keys` is unaffected and does persist: put it on the boot (FAT) partition and
+  `S30devdata` reinstalls it into `/root/.ssh/` on every boot, independent of the data partition.
+- **Each dev board names itself; the system hostname is the same everywhere.** The dev image derives
+  `seedsigner-<last 6 hex of the board serial>` at boot (`/usr/sbin/dev-name`, published at
+  `/etc/seedsigner-devname`) and uses it for both the mDNS `.local` record and the DHCP hostname
+  option, so any number of boards coexist on one LAN without a name fight. The *system* hostname
+  stays `seedsigner-os` on every image, because the app keys OS-specific behavior off
+  `os.uname()[1]` — so `hostname` is useless for telling two boards apart. Use the shell prompt,
+  `network-info`, or from another machine:
+  ```bash
+  avahi-browse -rt _ssh._tcp     # every SeedSigner on the link, name -> IP
+  ```
+  A one-line `hostname.txt` on the boot partition overrides the serial suffix
+  (`plus` -> `seedsigner-plus.local`), which is worth doing since serial hashes are unmemorable.
+- No `timeout` or `pgrep` on the device (busybox); use `ps | grep '[m]ain.py'`, and bound a
+  manual run with a background launch + `sleep N` + `kill` instead of `timeout`.
+- No `pytest` in the device Python env, so the repo's pytest suites cannot run on-device. Run a
+  native-module check as a **standalone assert script** (import, exercise, `print`/`SystemExit`)
+  from the dir holding the `.so`. For a binding whose behavior only manifests with real input
+  (e.g. `get_inactive_time_ms()` resetting on a keypress), verify it **through the app**: the
+  app logs the observable decision (the toast `showing toast` vs `canceled before showing`),
+  which is more reliable than trying to time a physical press against a headless probe window.
+- **A warm `reboot` can hang this dev image — prefer `seedsigner stop`/`start` or a power-cycle to
+  pick up a new `.so`.** Observed 2026-07-26: an `ssh <host> reboot` issued while the app was
+  still running (GPIO/SPI/camera held; not `stop`-ped first) left **both** a Pi Zero and a
+  SeedSigner+ off the network (`No route to host`) with the panel frozen on its last frame — the
+  app never restarted, so nothing re-ran `native_display_init`. Both needed a physical power-cycle.
+  `scripts/deploy-dev.sh` deliberately stops/starts the app and never reboots the device — mirror
+  that. Root cause unconfirmed (candidates: the app holding exclusive GPIO/SPI/camera fds at reboot,
+  a busy `/mnt/data` unmount stalling busybox shutdown, no watchdog to force the reset); confirming
+  it needs a serial console, since a hung warm-reboot leaves nothing over the network and a
+  power-cycle wipes the RAM logs. Note a power-cycle is also the only way to reproduce the
+  uninitialized-GRAM garbage strip on a wide panel — a warm reboot retains GRAM.
 
 ## Capturing what the camera sees, without a screen
 
