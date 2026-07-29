@@ -11,14 +11,23 @@ FROM debian:12-slim
 
 # Provenance of the buildroot output baked in below. Supplied by
 # docker/build_sdk_image.sh from the seedsigner-os checkout it extracted from.
+#
+# TARGET_PROFILE names which board's buildroot the sysroot was harvested from
+# (armv6 = Pi Zero/ARM1176, pi02w = Pi Zero 2 W/Cortex-A53). It is the ONLY
+# thing that distinguishes two otherwise interchangeable-looking SDKs: both
+# carry an `arm-Buildroot-linux-gnueabihf` toolchain and both build artifacts
+# with the same SOABI, so the tuple, the filenames and the OS provenance are all
+# identical between profiles. Only the sysroot's Tag_CPU_arch differs.
 ARG SS_OS_COMMIT=unknown
 ARG SS_OS_DESCRIBE=unknown
 ARG BUILDROOT_COMMIT=unknown
+ARG TARGET_PROFILE=armv6
 
 LABEL org.seedsigner.ss-os-commit="${SS_OS_COMMIT}" \
       org.seedsigner.ss-os-describe="${SS_OS_DESCRIBE}" \
       org.seedsigner.buildroot-commit="${BUILDROOT_COMMIT}" \
-      org.opencontainers.image.description="ARMv6 cross-compile SDK (toolchain + target sysroot) from SeedSigner OS ${SS_OS_DESCRIBE}"
+      org.seedsigner.target-profile="${TARGET_PROFILE}" \
+      org.opencontainers.image.description="${TARGET_PROFILE} cross-compile SDK (toolchain + target sysroot) from SeedSigner OS ${SS_OS_DESCRIBE}"
 
 # python3-pytest is Debian's PURE-PYTHON pytest. It is imported by buildroot's own
 # Python 3.12 (see the pytest step in docker/build_steps.sh, which puts
@@ -46,9 +55,10 @@ COPY host/ /output/host/
 RUN ln -sfn /output/host/arm-Buildroot-linux-gnueabihf/sysroot /output/staging
 
 # Readable from inside a running build (and by the ELF gate) so any artifact can
-# be traced back to the OS release its sysroot came from.
-RUN printf 'ss_os_commit=%s\nss_os_describe=%s\nbuildroot_commit=%s\n' \
-      "${SS_OS_COMMIT}" "${SS_OS_DESCRIBE}" "${BUILDROOT_COMMIT}" \
+# be traced back to the OS release its sysroot came from, and to the board profile
+# whose sysroot it is.
+RUN printf 'ss_os_commit=%s\nss_os_describe=%s\nbuildroot_commit=%s\ntarget_profile=%s\n' \
+      "${SS_OS_COMMIT}" "${SS_OS_DESCRIBE}" "${BUILDROOT_COMMIT}" "${TARGET_PROFILE}" \
       > /output/SS_OS_PROVENANCE
 
 ENV PATH="/output/host/bin:${PATH}"
