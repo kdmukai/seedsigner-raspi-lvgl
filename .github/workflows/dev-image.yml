@@ -1,0 +1,276 @@
+name: dev-image
+
+# Builds a flashable SeedSigner OS **dev** card per board, carrying this repo's
+# native extension, the app tree, and the language packs.
+#
+# ~5 minutes per board, not hours. A Buildroot build is dominated by compiling the
+# toolchain and every package, which depends only on the seedsigner-os ref and so
+# changes rarely. That work is done ONCE, off-CI, and published as a pre-baked
+# /output tree (docker/build_prebake_image.sh -> GHCR). Each run restores it, wipes
+# the stale app payload, stages the fresh .so + app + packs, and re-runs only the
+# tail of the build: overlay copy, cpio, kernel relink.
+#
+# The kernel relink is unavoidable -- CONFIG_INITRAMFS_SOURCE embeds the rootfs IN
+# the zImage, so a new payload is a new kernel -- but it is a relink, not a compile.
+# Measured at ~70s/board locally. See docs/knowledge/dev-image-incremental-rebuild.md.
+#
+# Keeping per-run compute small is deliberate and not only about cost: a repeated
+# multi-hour job is a resource profile that risks the account, so the expensive
+# build stays off CI entirely.
+#
+# One job per board: each builds exactly ONE target profile, which sidesteps the
+# armv6-last trap (a pi02w build in the same workspace would otherwise clear the
+# armv6 .so from src/ -- docs/knowledge/per-profile-so-build-order-and-image-staging.md).
+#
+# The boards are NOT combined into a multiboard card here. Each job emits its own
+# per-board .img, which is what gets flashed for local dev; combining stays a
+# convenience offered by scripts/build-dev-multiboard-image.sh.
+#
+# Read-only token: this workflow only pulls public images and uploads run-local
+# artifacts. Publishing the pre-baked tree is a separate, manual, local step -- the
+# only place needing packages:write, mirroring how the SDK images are published.
+permissions:
+  contents: read
+  packages: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_ref:
+        description: seedsigner-os ref on the bot fork to build from
+        default: integration/lvgl-dev
+      app_ref:
+        description: seedsigner (app) ref on the bot fork to bake in
+        default: integration/lvgl-mpy
+      packs_ref:
+        description: seedsigner-language-packs ref
+        default: main
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/dev-image.yml'
+      - 'scripts/build-dev-multiboard-image.sh'
+      - 'native/**'
+      - 'setup.py'
+      - 'versions.lock.toml'
+      - 'versions.lock.pi02w.toml'
+      - 'sources/seedsigner-lvgl-screens'
+      - 'sources/cUR'
+
+env:
+  # The cross-compile SDK pin. Both profiles share this tag: their sysroots are
+  # harvested from the same seedsigner-os commit built for different boards, so the
+  # tag names the OS provenance, NOT the board. The board is the repo name.
+  SDK_KEY: ss-os-0.8.0-81-gbfbd791
+  SDK_NS: ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl
+  # Pre-baked Buildroot tree, one per board, tagged with the seedsigner-os describe
+  # its packages were compiled from. Moving the OS pin means re-baking and moving
+  # this tag together.
+  #
+  # This deliberately does NOT match SDK_KEY. The SDK's sysroot was harvested at
+  # bfbd791 (#114); the prebaked tree is compiled from the integration tip
+  # ae9288f. Both are correct -- each names its own provenance -- and the
+  # staleness gate below is what proves the pair is still compatible rather than
+  # the tags matching. Do not "fix" one to equal the other.
+  PREBAKE_KEY: ss-os-v0.8.7-19-gae9288f
+
+jobs:
+  dev-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # board -> the .so profile that board needs. run_build.sh maps profile to
+          # its SDK image and lock; the image script maps board to the .so directory.
+          - board: pi0
+            profile: armv6
+            sdk_repo: sdk-armv6
+          - board: pi02w
+            profile: pi02w
+            sdk_repo: sdk-pi02w
+
+    steps:
+      # Sibling layout under $GITHUB_WORKSPACE mirrors the local dev workspace, so
+      # build-dev-multiboard-image.sh resolves APP_TREE and CACHE_TREE from its own
+      # sibling defaults with no path overrides needed.
+      - name: Checkout seedsigner-raspi-lvgl
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: seedsigner-raspi-lvgl
+          submodules: recursive
+
+      - name: Checkout seedsigner-os (bot fork)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kdmukAI-bot/seedsigner-os
+          ref: ${{ inputs.os_ref || 'integration/lvgl-dev' }}
+          path: seedsigner-os
+          submodules: recursive
+
+      - name: Checkout seedsigner app (bot fork)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kdmukAI-bot/seedsigner
+          ref: ${{ inputs.app_ref || 'integration/lvgl-mpy' }}
+          path: seedsigner
+          submodules: recursive
+          # Full history: the staging step runs the app's write_versionfile.py, which
+          # derives version.json from .git. A wrong or missing version.json breaks the
+          # app's version screens and its SeedSigner-OS checks.
+          fetch-depth: 0
+
+      - name: Checkout seedsigner-language-packs (bot fork)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: kdmukAI-bot/seedsigner-language-packs
+          ref: ${{ inputs.packs_ref || 'main' }}
+          path: seedsigner-language-packs
+          # Required: build_packs.sh hard-fails without the seedsigner-translations
+          # submodule, which carries the .po source.
+          submodules: recursive
+
+      - name: Reclaim runner disk
+        # Peak usage is the pre-baked image in the layer store (~16GB) PLUS its
+        # extracted copy on disk (~16GB) until the image is dropped. The stock runner
+        # ships several GB of toolchains this build never touches.
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Pull cross-compile SDK
+        run: docker pull "${SDK_NS}/${{ matrix.sdk_repo }}:${SDK_KEY}"
+
+      - name: Assert the SDK sysroot is not stale for this OS ref
+        # The SDK's sysroot comes from one seedsigner-os commit; this image is built
+        # from another (the integration tip). That is fine ONLY while nothing
+        # ABI-relevant changed between them -- a defconfig edit or a buildroot bump
+        # would leave the SDK's glibc/Python/libcamera out of step with the image,
+        # and the failure would surface as an opaque dlopen error on the device.
+        # Same class of silent staleness the SDK's own arch gate exists to catch.
+        run: |
+          set -euo pipefail
+          SDK_OS_COMMIT="$(docker inspect "${SDK_NS}/${{ matrix.sdk_repo }}:${SDK_KEY}" \
+            --format '{{index .Config.Labels "org.seedsigner.ss-os-commit"}}')"
+          echo "SDK sysroot from seedsigner-os ${SDK_OS_COMMIT}"
+          cd seedsigner-os
+          if ! git cat-file -e "${SDK_OS_COMMIT}^{commit}" 2>/dev/null; then
+            echo "::error::SDK's ss-os-commit ${SDK_OS_COMMIT} is not in this checkout; cannot prove the sysroot matches."
+            exit 1
+          fi
+          DRIFT="$(git diff --name-only "${SDK_OS_COMMIT}" HEAD -- \
+            '*/configs/*_defconfig' 'opt/buildroot' || true)"
+          if [ -n "${DRIFT}" ]; then
+            echo "::error::ABI-relevant drift between the SDK sysroot and this OS ref:"
+            echo "${DRIFT}"
+            echo "Rebuild the SDK (docker/build_sdk_image.sh) and move SDK_KEY."
+            exit 1
+          fi
+          echo "No defconfig / buildroot drift -- SDK sysroot is valid for this OS ref."
+
+      - name: Restore the pre-baked Buildroot tree
+        # Extract to the host because the build binds ./output into the build
+        # container. The image is dropped immediately afterwards: holding both the
+        # layers and the extracted copy is the disk high-water mark, and nothing
+        # needs the layers once the tree is on disk.
+        run: |
+          set -euo pipefail
+          PREBAKE="${SDK_NS}/prebake-${{ matrix.board }}:${PREBAKE_KEY}"
+          echo "pulling ${PREBAKE}"
+          docker pull "${PREBAKE}"
+
+          PB_OS_COMMIT="$(docker inspect "${PREBAKE}" \
+            --format '{{index .Config.Labels "org.seedsigner.ss-os-commit"}}')"
+          echo "pre-baked tree from seedsigner-os ${PB_OS_COMMIT}"
+
+          cid="$(docker create "${PREBAKE}")"
+          docker cp "${cid}:/output" "${GITHUB_WORKSPACE}/seedsigner-os/output"
+          docker rm "${cid}"
+          docker image rm "${PREBAKE}"
+
+          test -d "${GITHUB_WORKSPACE}/seedsigner-os/output/target" \
+            || { echo "::error::restored tree has no output/target"; exit 1; }
+          echo "restored:"; df -h / | tail -1
+
+      - name: Restore extension ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-ccache
+          # Unique per-run key so the post-job save always runs; restore-keys pulls
+          # the newest prior cache. Keyed on the SDK so a toolchain change starts
+          # clean rather than reusing objects from a different compiler.
+          key: ccache-devimg-${{ matrix.profile }}-${{ env.SDK_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-devimg-${{ matrix.profile }}-${{ env.SDK_KEY }}-
+
+      - name: Cross-compile the native extension (${{ matrix.profile }})
+        working-directory: seedsigner-raspi-lvgl
+        env:
+          WS_ROOT: ${{ github.workspace }}
+          CCACHE_HOST_DIR: ${{ github.workspace }}/.ci-ccache
+          TARGET_PROFILE: ${{ matrix.profile }}
+        run: |
+          mkdir -p "${CCACHE_HOST_DIR}"
+          ./run_build.sh
+
+      - name: Build language packs into the app tree
+        run: |
+          seedsigner-language-packs/scripts/build_packs.sh \
+            --out-dir "${GITHUB_WORKSPACE}/seedsigner/src/lang-packs"
+
+      - name: Stage and build the ${{ matrix.board }} dev image
+        working-directory: seedsigner-raspi-lvgl
+        env:
+          # APP_TREE and CACHE_TREE resolve from the sibling layout; only OS_TREE
+          # needs pointing, since its default is a local .tmp worktree.
+          OS_TREE: ${{ github.workspace }}/seedsigner-os
+          BOARDS_TO_BUILD: ${{ matrix.board }}
+          VERSION: lvgl-dev
+          # Reuse the restored tree: --no-clean plus the in-container wipe of the
+          # stale app payload. Buildroot's output/target is additive, so without the
+          # wipe a file dropped from the overlay would survive into the image.
+          INCREMENTAL: '1'
+        run: ./scripts/build-dev-multiboard-image.sh build "${{ matrix.board }}"
+
+      - name: Record build provenance
+        # Every card must trace back to exact refs -- the same property the SDK
+        # images carry, applied to the image this workflow ships.
+        run: |
+          set -euo pipefail
+          OUT=seedsigner-os/images
+          IMG="${OUT}/seedsigner_os.lvgl-dev.${{ matrix.board }}-dev.img"
+          {
+            echo "board=${{ matrix.board }}"
+            echo "profile=${{ matrix.profile }}"
+            echo "sdk=${SDK_NS}/${{ matrix.sdk_repo }}:${SDK_KEY}"
+            echo "prebake=${SDK_NS}/prebake-${{ matrix.board }}:${PREBAKE_KEY}"
+            echo "raspi_lvgl=$(git -C seedsigner-raspi-lvgl rev-parse HEAD)"
+            echo "seedsigner_os=$(git -C seedsigner-os rev-parse HEAD)"
+            echo "app=$(git -C seedsigner rev-parse HEAD)"
+            echo "lang_packs=$(git -C seedsigner-language-packs rev-parse HEAD)"
+          } | tee "${OUT}/build-provenance.${{ matrix.board }}.txt"
+          sha256sum "${IMG}" | tee "${IMG}.sha256"
+
+      - name: Upload dev image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dev-image-${{ matrix.board }}-${{ github.sha }}
+          path: |
+            seedsigner-os/images/seedsigner_os.lvgl-dev.${{ matrix.board }}-dev.img
+            seedsigner-os/images/seedsigner_os.lvgl-dev.${{ matrix.board }}-dev.img.sha256
+            seedsigner-os/images/build-provenance.${{ matrix.board }}.txt
+          if-no-files-found: error
+
+      - name: Upload extension build logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: dev-image-logs-${{ matrix.board }}-${{ github.run_id }}
+          path: seedsigner-raspi-lvgl/logs/
+          if-no-files-found: warn
