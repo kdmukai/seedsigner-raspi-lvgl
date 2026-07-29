@@ -21,8 +21,14 @@
 # armv6 and pi02w builds never see each other's binaries.
 #
 # INPUTS
-#   APP_TREE  seedsigner checkout (default: the sibling repo, whatever is checked out)
-#   OS_TREE   seedsigner-os worktree carrying the dev-hostname + dev-combine work
+#   APP_TREE     seedsigner checkout (default: the sibling repo, whatever is checked out)
+#   OS_TREE      seedsigner-os worktree carrying the dev-hostname + dev-combine work
+#   CACHE_TREE   holds the shared Buildroot dl / ccache dirs
+#   VERSION      middle field of the output filename
+#   BOARDS_TO_BUILD  space-separated board list (default: pi0 pi02w)
+#   INCREMENTAL  1 = reuse an already-built Buildroot tree and rebuild only the
+#                payload (~70s/board vs hours). Requires OS_TREE/output to be a
+#                complete tree for the board being built.
 #
 # The app is staged into the OS tree's rootfs overlay and built with --skip-repo,
 # so the image contains exactly the local tree -- no clone, no network. The
@@ -41,11 +47,17 @@ set -o errexit -o nounset -o pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-APP_TREE="${APP_TREE:-/home/kdmukai/dev/seedsigner}"
+# Sibling checkouts under the shared workspace parent, resolved relative to this
+# repo so the defaults work in any clone (a CI runner included). `cd && pwd`
+# normalises away the `..` so log lines and the compose override read cleanly;
+# the fallback keeps the unresolved path for the error message when it is absent.
+_sibling() { (cd "${REPO_ROOT}/../$1" 2>/dev/null && pwd) || echo "${REPO_ROOT}/../$1"; }
+
+APP_TREE="${APP_TREE:-$(_sibling seedsigner)}"
 OS_TREE="${OS_TREE:-${REPO_ROOT}/.tmp/ss-os-devimg}"
 # Where the shared Buildroot download / ccache directories live (the primary
 # seedsigner-os checkout, since a worktree has none of its own).
-CACHE_TREE="${CACHE_TREE:-/home/kdmukai/dev/seedsigner-os}"
+CACHE_TREE="${CACHE_TREE:-$(_sibling seedsigner-os)}"
 
 # Middle field of seedsigner_os.<version>.<board>-dev.img. Passed to build.sh as
 # --app-branch, which under --skip-repo only names the output file.
@@ -191,7 +203,15 @@ write_compose_override() {
   # recompiled. Sharing the primary checkout's caches is the difference between a
   # warm build and a cold one; Buildroot's dl cache is content-addressed and ccache
   # is keyed on compiler+flags, so sharing them across trees is safe.
-  [[ -d "$CACHE_TREE" ]] || die "cache tree not found: ${CACHE_TREE}"
+  # A missing CACHE_TREE is created rather than fatal, so a fresh CI runner can
+  # point it at a restored cache directory. It is still called out: the usual
+  # cause on a workstation is a typo'd path, and the only symptom would otherwise
+  # be a cold build that looks normal but takes hours instead of minutes.
+  if [[ ! -d "$CACHE_TREE" ]]; then
+    log "WARNING: cache tree ${CACHE_TREE} does not exist -- creating it."
+    log "         Caches start EMPTY: this build recompiles everything from scratch."
+    mkdir -p "$CACHE_TREE"
+  fi
   mkdir -p "${CACHE_TREE}/.buildroot_dl" "${CACHE_TREE}/.ccache" "${CACHE_TREE}/.buildroot-ccache"
   cat > "${OS_TREE}/docker-compose.override.yml" <<EOF
 services:
@@ -227,12 +247,42 @@ else:
 PY
 }
 
+# Buildroot's output/target is built up ADDITIVELY: target-finalize copies the
+# overlay over it and never prunes, so a file dropped from the overlay survives
+# into the next rootfs.cpio. Across repeated payload swaps that means stale app
+# files accumulate in the image forever. Wiping the app directory before an
+# incremental rebuild is what keeps the payload equal to the overlay.
+#
+# It has to run as root INSIDE the container: everything under output/ is
+# root-owned (post-build.sh writes __pycache__ as root), so a host-side rm dies
+# with EPERM partway through and leaves a half-cleaned tree.
+wipe_target_opt() {
+  log "wiping output/target/opt (additive target dir; stale payload otherwise persists)"
+  compose_run --entrypoint bash build-images -c 'rm -rf /output/target/opt'
+}
+
 build_board() {
   local board="$1"
-  log "building ${board}-dev (hours on a cold tree)"
+  # INCREMENTAL reuses an already-built Buildroot tree and re-runs only the tail
+  # of the build -- overlay copy, cpio, kernel relink. The kernel relink is
+  # unavoidable because CONFIG_INITRAMFS_SOURCE embeds the rootfs IN the zImage,
+  # so a new payload is a new kernel; it is still a relink, not a compile.
+  # Requires a tree that is already fully built for THIS board -- build.sh's
+  # per-board clean is what --no-clean suppresses, so pointing it at another
+  # board's tree links that board's objects.
+  local extra=()
+  if [[ "${INCREMENTAL:-0}" == "1" ]]; then
+    [[ -d "${OS_TREE}/output/target" ]] \
+      || die "INCREMENTAL=1 but ${OS_TREE}/output has no built tree for ${board}"
+    wipe_target_opt
+    extra+=(--no-clean)
+    log "building ${board}-dev (incremental: overlay + cpio + kernel relink)"
+  else
+    log "building ${board}-dev (hours on a cold tree)"
+  fi
   # Args after the service name replace the compose `command`, and the image's
   # ENTRYPOINT is build.sh, so these are build.sh's own flags.
-  compose_run build-images "--${board}" --dev --skip-repo "--app-branch=${VERSION}"
+  compose_run build-images "--${board}" --dev --skip-repo "${extra[@]}" "--app-branch=${VERSION}"
   local img="${OS_TREE}/images/seedsigner_os.${VERSION}.${board}-dev.img"
   [[ -f "$img" ]] || die "build finished but ${img} is missing"
   log "built $(basename "$img") ($(du -h "$img" | cut -f1))"
@@ -265,7 +315,20 @@ case "$cmd" in
     write_compose_override
     build_container
     shift || true
-    for b in ${*:-$BOARDS_TO_BUILD}; do stage_app "$b"; build_board "$b"; done
+    # SKIP_STAGE reuses whatever is already in the overlay instead of re-staging.
+    # Needed to compare two builds byte-for-byte: write_versionfile.py stamps
+    # version.json with wall-clock time, so re-staging changes the payload on every
+    # run and cascades into rootfs.cpio -> zImage -> .img. Holding the payload fixed
+    # is the only way to attribute a hash difference to the thing under test (e.g. a
+    # slimmed Buildroot tree) rather than to the clock.
+    for b in ${*:-$BOARDS_TO_BUILD}; do
+      if [[ "${SKIP_STAGE:-0}" == "1" ]]; then
+        log "SKIP_STAGE=1: reusing the existing overlay payload for ${b}"
+      else
+        stage_app "$b"
+      fi
+      build_board "$b"
+    done
     ;;
   combine)
     combine
