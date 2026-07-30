@@ -24,13 +24,18 @@ ARG SS_OS_COMMIT=unknown
 ARG SS_OS_DESCRIBE=unknown
 ARG BUILDROOT_COMMIT=unknown
 ARG BOARD=unknown
+# slim = per-package build dirs reduced to an allowlist (see
+# docker/slim_prebake_tree.sh); full = the tree as Buildroot left it. Both build
+# identically; they differ ~4x in size, which is what governs CI peak disk.
+ARG TREE_VARIANT=unknown
 
 LABEL org.seedsigner.ss-os-commit="${SS_OS_COMMIT}" \
       org.seedsigner.ss-os-describe="${SS_OS_DESCRIBE}" \
       org.seedsigner.buildroot-commit="${BUILDROOT_COMMIT}" \
       org.seedsigner.board="${BOARD}" \
+      org.seedsigner.tree-variant="${TREE_VARIANT}" \
       org.seedsigner.dev-build="1" \
-      org.opencontainers.image.description="Pre-baked ${BOARD} dev Buildroot tree from SeedSigner OS ${SS_OS_DESCRIBE}"
+      org.opencontainers.image.description="Pre-baked ${BOARD} dev Buildroot tree (${TREE_VARIANT}) from SeedSigner OS ${SS_OS_DESCRIBE}"
 
 # The built tree, at the absolute path Buildroot and build.sh expect. Buildroot
 # bakes absolute paths into its own artifacts, so /output must stay /output.
@@ -42,6 +47,6 @@ COPY output/ /output/
 # overlay put there. Starting empty makes the first real payload authoritative.
 RUN rm -rf /output/target/opt
 
-RUN printf 'ss_os_commit=%s\nss_os_describe=%s\nbuildroot_commit=%s\nboard=%s\ndev_build=1\n' \
-      "${SS_OS_COMMIT}" "${SS_OS_DESCRIBE}" "${BUILDROOT_COMMIT}" "${BOARD}" \
+RUN printf 'ss_os_commit=%s\nss_os_describe=%s\nbuildroot_commit=%s\nboard=%s\ntree_variant=%s\ndev_build=1\n' \
+      "${SS_OS_COMMIT}" "${SS_OS_DESCRIBE}" "${BUILDROOT_COMMIT}" "${BOARD}" "${TREE_VARIANT}" \
       > /output/SS_OS_PREBAKE_PROVENANCE

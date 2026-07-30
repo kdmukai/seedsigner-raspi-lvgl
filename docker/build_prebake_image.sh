@@ -30,24 +30,16 @@ SS_OS_DIR="${SS_OS_DIR:-$(cd "${ROOT_DIR}/../seedsigner-os" 2>/dev/null && pwd |
 SLIM=0
 for arg in "$@"; do
   case "$arg" in
+    # An ASSERTION, not an action: slimming is a separate step
+    # (docker/slim_prebake_tree.sh) because the slim tree must be validated by an
+    # incremental build BEFORE it is baked, and the tree that gets validated has
+    # to be the exact tree that gets shipped. --slim refuses to bake a full tree,
+    # for the operator who means to publish the small one.
     --slim) SLIM=1 ;;
     --board=*) BOARD="${arg#--board=}" ;;
     *) echo "[prebake] ERROR: unknown argument '$arg'" >&2; exit 1 ;;
   esac
 done
-
-# The slim (allowlist) tree is DESIGNED but NOT VALIDATED. A trimmed tree fails at
-# target-finalize -- 20s from the end, after the expensive part -- and one of the
-# reachbacks (post-build.sh's OpenSSH scp fix-up) is guarded, so its absence is a
-# SILENT defect: green build, broken scp on the device. Shipping it on an unproven
-# allowlist would be a CI regression that looks like success.
-if [[ "${SLIM}" == "1" ]]; then
-  echo "[prebake] ERROR: --slim is not implemented yet, deliberately." >&2
-  echo "          The allowlist and the byte-comparison gate it needs are specified in" >&2
-  echo "          docs/prebake-slimming-todo.md. Bake the FULL tree first so the slim" >&2
-  echo "          variant can be diffed against a known-good baseline." >&2
-  exit 1
-fi
 
 BOARD="${BOARD:-}"
 case "${BOARD}" in
@@ -147,6 +139,28 @@ check_reachback "python3 compileall.py (__pycache__ gen)"   ${B}/python3-*/Lib/c
 check_reachback "OpenSSH scp (silent dropbear-collision fix-up)" ${B}/openssh-*/scp
 echo "[prebake] build-dir reachbacks OK"
 
+# --- Gate 4: which variant of the tree is this? -------------------------------
+# Recorded rather than left to be inferred later, because the two variants are
+# indistinguishable once published except by size, and size is exactly what a
+# consumer is trying to predict.
+#
+# Read from a MARKER slim_prebake_tree.sh writes, not inferred from the tree's
+# shape. The tempting structural signature -- a package dir holding its .stamp_*
+# files and nothing else -- is wrong: Buildroot's virtual and script-only packages
+# (jpeg, openssl, toolchain, skeleton, urandom-scripts, ... 16 of them here) look
+# exactly like that in a FULL tree, so the check reports every tree as slim and the
+# guard below silently never fires.
+SLIM_MARKER="${OUTPUT_DIR}/SS_OS_SLIM_ALLOWLIST"
+if [[ -f "${SLIM_MARKER}" ]]; then TREE_VARIANT=slim; else TREE_VARIANT=full; fi
+
+if [[ "${SLIM}" == "1" && "${TREE_VARIANT}" != "slim" ]]; then
+  echo "[prebake] ERROR: --slim was given but ${OUTPUT_DIR} is a FULL tree." >&2
+  echo "          Slim it first:  SS_OS_OUTPUT_DIR=${OUTPUT_DIR} ./docker/slim_prebake_tree.sh" >&2
+  echo "          then validate the result per docs/knowledge/prebake-tree-slimming.md" >&2
+  echo "          and point this script at the slim tree." >&2
+  exit 1
+fi
+echo "[prebake] tree variant   = ${TREE_VARIANT}"
 echo "[prebake] tree size $(du -sh "${OUTPUT_DIR}" 2>/dev/null | cut -f1 || echo unknown)"
 
 # --- Build --------------------------------------------------------------------
@@ -182,6 +196,7 @@ docker build \
   --build-arg "SS_OS_DESCRIBE=${SS_OS_DESCRIBE}" \
   --build-arg "BUILDROOT_COMMIT=${BUILDROOT_COMMIT}" \
   --build-arg "BOARD=${BOARD}" \
+  --build-arg "TREE_VARIANT=${TREE_VARIANT}" \
   -t "${IMAGE_TAG}" \
   -f "${ROOT_DIR}/docker/Dockerfile.prebake" \
   "${OUTPUT_PARENT}"
