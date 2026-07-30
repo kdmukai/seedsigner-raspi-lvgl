@@ -44,6 +44,7 @@ Inside `build/`:
 |---|---|---|
 | `linux-custom/` **entire** | the kernel relink; `post-image-seedsigner.sh` runs `scripts/dtc/dtc` and `cpp` over `arch/arm/boot/dts/overlays` with `-I include` | loud |
 | `python3-3.12.10/` | `post-build.sh` runs `Lib/compileall.py` by path with the host interpreter | loud |
+| `busybox-*/` **entire** | `make oldconfig`, re-run whenever the board's config fragment is newer than `.stamp_dotconfig` | loud, **but only in CI** |
 | `buildroot-fs/` | `cpio/fakeroot` **assembles `rootfs.cpio`**; also the device/user tables | loud |
 | `buildroot-config/` | the kconfig binaries Buildroot re-runs to reload `.config` | loud |
 | `openssh-*/scp` | `post-build.sh`'s dropbear-collision fix-up | **SILENT** |
@@ -64,6 +65,47 @@ Package dirs outside the allowlist are reduced to their **top-level dotfiles**, 
 to `.stamp_*` alone. `.files-list*.txt` and `.applied_patches_list` cost megabytes
 across all 163 packages, and the failure mode of guessing wrong is a 20-minute build
 that dies at the end.
+
+## kconfig packages need their sources, and only CI proves it
+
+Buildroot's kconfig packages — `linux`, `busybox`, `linux-backports`, `swupdate`,
+`uclibc`, `xvisor`; only the first two are in this build — are the one class whose
+`.stamp_*` file has a **real** prerequisite rather than an order-only one:
+
+```make
+$(BUSYBOX_DIR)/.stamp_dotconfig: $(BUSYBOX_KCONFIG_FILE) $(BUSYBOX_KCONFIG_FRAGMENT_FILES)
+```
+
+So whenever the board's `busybox.config.fragment` is newer than the stamp, make
+re-runs the dotconfig step, which calls `make oldconfig` **inside the package build
+directory**. With only `.config` kept, that fails:
+
+```
+# merged configuration written to /output/build/busybox-1.36.1/.config (needs make)
+make[2]: *** No rule to make target 'oldconfig'.  Stop.
+make[1]: *** [package/busybox/busybox.mk:476: .../.stamp_dotconfig] Error 2
+```
+
+**This never reproduces locally.** The prebake tree is built from the OS tree in
+place, so the stamps end up *newer* than the fragments and the step is skipped. In CI
+the OS tree is a fresh `actions/checkout`, so every file carries the checkout time and
+is newer than every stamp — the step always runs. A slim tree can therefore pass the
+full local gate and still fail on the first real CI run, which is exactly what
+happened.
+
+Two consequences:
+
+1. Keep kconfig packages **whole**, not pruned to `.config`. busybox is 47 MB.
+2. **The validation gate must simulate a fresh checkout** — otherwise it does not
+   exercise the path CI takes. Before each side of the comparison:
+   ```sh
+   find opt -maxdepth 3 -path opt/buildroot -prune -o -print0 | xargs -0 touch
+   ```
+   Verified harmless to the comparison: busybox rebuilds reproducibly
+   (`BR2_REPRODUCIBLE=y`), so the touched baseline is byte-identical to the untouched
+   one — 4635 files, no diff. It does mean CI recompiles busybox on every run, which
+   is a couple of minutes and the correct behaviour: if the fragment genuinely
+   changes, the rebuild picks it up instead of silently shipping a stale config.
 
 ## The silent one
 
@@ -115,10 +157,12 @@ manifest() {   # $1 = output label
 }
 ```
 
-Protocol — `SKIP_STAGE=1` is mandatory (see entropy, below):
+Protocol — `SKIP_STAGE=1` is mandatory (see entropy, below), and **both** sides must
+run with freshly-touched OS-tree mtimes or the gate misses the kconfig path above:
 
-1. Build on the **full** tree, `INCREMENTAL=1` → `manifest full`.
-2. Swap in the slim tree, rebuild with `INCREMENTAL=1 SKIP_STAGE=1` → `manifest slim`.
+1. Touch the OS tree, build on the **full** tree, `INCREMENTAL=1` → `manifest full`.
+2. Touch again, swap in the slim tree, rebuild with `INCREMENTAL=1 SKIP_STAGE=1`
+   → `manifest slim`.
 3. `diff` them. Must be empty.
 4. Then the checks a content manifest cannot make:
    - `target/usr/bin/scp` hash-matches `build/openssh-*/scp` (the guarded fix-up ran)
@@ -131,9 +175,12 @@ image.
 
 ### Measured result, pi0 (`v0.8.7-19-gae9288f`)
 
-4635 files hashed, manifest diff **empty**; scp hash-matched OpenSSH's; 12
-`__pycache__` dirs; 5878 `target/` entries identical in type, uid:gid and mode. The
-slim tree is byte-for-byte equivalent to the full one for image-building purposes.
+Both sides built with freshly-touched OS-tree mtimes: 4635 files hashed, manifest diff
+**empty**; scp hash-matched OpenSSH's; 12 `__pycache__` dirs; 5878 `target/` entries
+identical in type, uid:gid and mode. The slim tree is byte-for-byte equivalent to the
+full one for image-building purposes.
+
+Tree 16 GB → 4.6 GB; image 21.6 GB → 7.49 GB; pull 4.43 GB → 2.12 GB.
 
 ## Build entropy: two independent per-run sources
 

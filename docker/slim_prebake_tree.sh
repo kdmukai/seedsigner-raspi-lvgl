@@ -82,9 +82,24 @@ echo "[slim] dest   = ${DEST}$( ((DRY_RUN)) && echo '  (dry run: nothing written
 #                         first on sys.path, so Lib/ resolves compileall's imports
 #                         too and has to be intact. The whole dir is only ~150M,
 #                         so it is kept entire rather than pruned to Lib/.
+#   busybox-*             A kconfig package, like linux-custom. Its .stamp_dotconfig
+#                         has a REAL prerequisite on the board's
+#                         busybox.config.fragment, so when that file is newer than
+#                         the stamp -- which it always is in CI, where the OS tree is
+#                         a fresh checkout stamped with the checkout time -- make
+#                         re-runs the dotconfig step and calls `make oldconfig` in
+#                         this directory. Without the sources that fails with
+#                         "No rule to make target 'oldconfig'". Keeping only
+#                         busybox-*/.config is enough for target-finalize but NOT for
+#                         this, and the difference does not show up in a local
+#                         validation run, where the stamp is newer than the fragment.
+#                         Buildroot's kconfig packages are linux, busybox,
+#                         linux-backports, swupdate, uclibc and xvisor; only the
+#                         first two are in this build.
 KEEP_FULL_GLOBS=(
   'linux-custom'
   'python3-3.12.10'
+  'busybox-*'
 )
 
 # Buildroot's own infrastructure directories -- NOT packages, and easy to miss
@@ -106,11 +121,9 @@ KEEP_FULL_GLOBS+=(
 #                         client is disabled, so post-build.sh overwrites it with
 #                         OpenSSH's. That fix-up is GUARDED -- absence skips it
 #                         silently and ships a broken scp. THE SILENT ONE.
-#   busybox-*/.config     busybox re-reads its generated Kconfig at
-#                         target-finalize. Loud failure if missing.
+# (busybox-*/.config is covered by keeping busybox-* whole, above.)
 KEEP_FILE_GLOBS=(
   'openssh-*/scp'
-  'busybox-*/.config'
 )
 
 # Every other package dir is reduced to its top-level DOTFILES (see the copy loop
