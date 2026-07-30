@@ -221,26 +221,39 @@ Buildroot build, published the same way, for different jobs:
 
 | | SDK (`sdk-<profile>`) | Prebake (`prebake-<board>`) |
 |---|---|---|
-| Carries | `output/host` — cross toolchain + target sysroot | `output/` entire, including `build/` |
-| Size | ~1.5 GB | ~16 GB |
+| Carries | `output/host` — cross toolchain + target sysroot | `output/` incl. an allowlisted `build/` |
+| Size | ~1.5 GB | ~7.5 GB (~2 GB to pull) |
 | Answers | "compile this C++ for ARM" | "don't rebuild 200 OS packages" |
 | Produces | the `.so` | the flashable `.img` |
 | Keyed per | target **profile** (arch) | **board** (board + dev defconfig) |
 | Consumed by | `build.yml` **and** `dev-image.yml` | `dev-image.yml` only |
 
 The SDK is a *subset* of the prebake, kept separate because every PR pulls the SDK
-and nobody wants a 16 GB pull for a `.so` build.
+and nobody wants a multi-GB pull for a `.so` build.
 
 `dev-image.yml` restores the prebaked tree and re-runs only the payload tail —
 overlay copy, cpio, kernel relink — which is ~70 s per board instead of hours. That
 is what keeps per-run CI compute small; the expensive build happens here, locally,
 only when the seedsigner-os pin moves.
 
+Baking is two steps, because the tree that gets published is an allowlisted **slim**
+copy and it has to be validated by a real build before it ships:
+
 ```bash
-# Requires a COMPLETE --dev Buildroot tree for that board (not a trimmed one).
-BOARD=pi0   SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output ./docker/build_prebake_image.sh
-BOARD=pi02w SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output ./docker/build_prebake_image.sh
+# 1. materialise the slim tree alongside the full one (~16 GB -> ~4.5 GB).
+#    Runs the copy as root in a container: output/ is root-owned and target/'s
+#    uid/gid map into rootfs.cpio.
+SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output ./docker/slim_prebake_tree.sh
+
+# 2. validate it, then bake from the tree you validated. --slim refuses a full tree.
+#    Validation protocol: docs/knowledge/prebake-tree-slimming.md
+BOARD=pi0 SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output.slim \
+  ./docker/build_prebake_image.sh --slim
 ```
+
+Slimming cuts CI peak disk from ~38 GB to ~12 GB, which is the point — the restore
+step holds the layers *and* the extracted copy at once. The variant is recorded as the
+`org.seedsigner.tree-variant` label, and `dev-image.yml` refuses anything but `slim`.
 
 The producer refuses rather than publishing a subtly wrong tree. It gates on:
 
@@ -253,6 +266,8 @@ The producer refuses rather than publishing a subtly wrong tree. It gates on:
   and `openssh-*/scp`. The last is **guarded** in `post-build.sh`, so its absence is
   silent: dropbear's `scp` would ship with its client disabled, breaking `scp` on the
   device with a green build. The producer hard-fails on it anyway.
+- **the tree variant** — full vs slim, detected structurally and recorded on the
+  image, so a consumer can tell which it is without measuring.
 
 It also strips `output/target/opt` at bake time, so no leftover app payload can
 collide with the first real one (`output/target` is additive — overlays are copied
@@ -260,9 +275,6 @@ over it and never pruned).
 
 Push and make public exactly as for the SDK above, then set `PREBAKE_KEY` in
 `.github/workflows/dev-image.yml` to the new tag.
-
-Slimming the tree to cut CI peak disk is designed but unvalidated — `--slim` refuses
-and points at `docs/prebake-slimming-todo.md`.
 
 ### Submodules
 

@@ -67,9 +67,11 @@ Two separate reachbacks into build directories that are not inert scratch:
    `${BUILD_DIR}/python3-3.12.10/Lib/`** to pre-generate `__pycache__`. That one is
    project-specific and will not be found by reading Buildroot's manual.
 
-A trim is still possible with an allowlist, but the failure surfaces only at the end of a
-build, so an untested allowlist is a silent CI regression waiting to happen. Ship the full
-tree until a trim has actually been run end to end.
+An **allowlist** does work, and is what the published trees carry — but the failure
+surfaces only at the end of a build (or not at all, for the guarded `scp` fix-up), so it
+is only trustworthy once run end to end against a per-file manifest of `output/target`.
+The allowlist, the full set of reachbacks and that validation protocol:
+`prebake-tree-slimming.md`.
 
 ## Why this matters for CI
 

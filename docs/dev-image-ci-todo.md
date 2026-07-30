@@ -16,7 +16,7 @@ written and awaiting those images.
 | lang-packs in CI | resolved — no code change needed, two workflow steps |
 | `prebake-pi0`, `prebake-pi02w` on GHCR | **← in progress (local bake + push)** |
 | First green run | blocked on the above |
-| Tree slimming | deferred → `prebake-slimming-todo.md` |
+| Tree slimming | done for pi0 — validated, 21.6 GB → 7.44 GB image |
 
 ## Shape, and why
 
@@ -64,13 +64,21 @@ it fails if any `*_defconfig` or the buildroot submodule changed between the SDK
 
 ## Known risks for the first run
 
-1. **Peak disk during restore.** The step holds the image layers *and* the extracted
-   copy (~16 GB + ~16 GB). Runner free space after the reclaim step is unmeasured; this
-   is the most likely first failure, and the main driver for slimming.
-2. **Restore may dominate runtime.** Pulling + extracting several GB could exceed the
-   ~70 s build it exists to enable.
+1. **Peak disk during restore.** The step holds the image layers (~7.5 GB) *and* the
+   extracted copy (~4.9 GB) — ~12 GB, against ~38 GB before the tree was slimmed.
+   Runner free space after the reclaim step is still unmeasured, but this is no longer
+   the tightest constraint. `docs/knowledge/prebake-tree-slimming.md`.
+2. **Restore may dominate runtime.** Pulling + extracting ~2 GB of layers could exceed
+   the ~70 s build it exists to enable.
 3. **Unexercised paths**: the producer's gates, the `.config` board-identity `sed`, the
    `.dockerignore` build-context handling, and `INCREMENTAL=1`.
+
+## Open
+
+- **pi02w's slim tree is unvalidated.** The allowlist is board-independent as written
+  (both boards' hooks reach back to the same paths), but only pi0 has been through the
+  manifest gate. Run it when the pi02w tree is next built — the baseline is perishable,
+  so validate *before* moving on, per `docs/knowledge/prebake-tree-slimming.md`.
 
 ## Not carried over from the local script
 
