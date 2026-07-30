@@ -132,9 +132,10 @@ jobs:
           submodules: recursive
 
       - name: Reclaim runner disk
-        # Peak usage is the pre-baked image in the layer store (~16GB) PLUS its
-        # extracted copy on disk (~16GB) until the image is dropped. The stock runner
-        # ships several GB of toolchains this build never touches.
+        # Peak usage is the pre-baked image in the layer store (~7.5GB) PLUS its
+        # extracted copy on disk (~4.9GB) until the image is dropped -- ~12GB, which
+        # is what the slim tree bought (a full tree is ~38GB and does not fit).
+        # The stock runner ships several GB of toolchains this build never touches.
         run: |
           set -euo pipefail
           echo "before:"; df -h / | tail -1
@@ -188,6 +189,16 @@ jobs:
           PB_OS_COMMIT="$(docker inspect "${PREBAKE}" \
             --format '{{index .Config.Labels "org.seedsigner.ss-os-commit"}}')"
           echo "pre-baked tree from seedsigner-os ${PB_OS_COMMIT}"
+
+          # A full tree needs ~38GB at the high-water mark below and would fail
+          # mid-extract with a confusing ENOSPC. Refuse up front, before the pull's
+          # work is wasted on a tree that cannot fit.
+          PB_VARIANT="$(docker inspect "${PREBAKE}" \
+            --format '{{index .Config.Labels "org.seedsigner.tree-variant"}}')"
+          if [ "${PB_VARIANT}" != "slim" ]; then
+            echo "::error::${PREBAKE} is a '${PB_VARIANT}' tree; this job needs a slim one (see docs/knowledge/prebake-tree-slimming.md)."
+            exit 1
+          fi
 
           cid="$(docker create "${PREBAKE}")"
           docker cp "${cid}:/output" "${GITHUB_WORKSPACE}/seedsigner-os/output"
