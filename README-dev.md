@@ -77,9 +77,33 @@ registries so every consumer (and mirror) stays in sync:
 
 | Registry | Role |
 |----------|------|
-| `ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-armv6:ss-os-<describe>` | primary — pulled by all CI configs and local `run_build.sh` |
-| `registry.gitlab.com/kdmukai-bot/seedsigner-raspi-lvgl/sdk-armv6:ss-os-<describe>` | mirror (fallback via `IMAGE_TAG=` override) |
-| `codeberg.org/kdmukai-bot/seedsigner-raspi-lvgl/sdk-armv6:ss-os-<describe>` | mirror (kept in sync across the bot's forges) |
+| `ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-<profile>:ss-os-<describe>` | primary — pulled by all CI configs and local `run_build.sh` |
+| `registry.gitlab.com/kdmukai-bot/seedsigner-raspi-lvgl/sdk-<profile>:ss-os-<describe>` | mirror (fallback via `IMAGE_TAG=` override) |
+| `codeberg.org/kdmukai-bot/seedsigner-raspi-lvgl/sdk-<profile>:ss-os-<describe>` | mirror (kept in sync across the bot's forges) |
+
+**There is one image per target profile**, selected by `TARGET_PROFILE`
+(`armv6` → `sdk-armv6`, `pi02w` → `sdk-pi02w`), and a multi-board image build
+needs **both** published. The two are near-indistinguishable from the outside —
+same `arm-Buildroot-linux-gnueabihf` tuple, same SOABI, same artifact filename,
+same OS pin and therefore the same tag — so the only reliable discriminators are
+the `org.seedsigner.target-profile` label and the sysroot's `Tag_CPU_arch`
+(`v6KZ` for armv6, `v8` for pi02w). `build_sdk_image.sh` reads that arch out of
+the extracted sysroot and refuses to build if it disagrees with the requested
+profile, which is what stops the common mistake: `SS_OS_CONTAINER` holds
+whichever board was built **last**, so asking for `pi02w` right after a pi0 OS
+build would otherwise package an ARMv6 sysroot under the pi02w tag and fail only
+at `dlopen` on the device.
+
+Verify a built or pulled image before trusting it:
+
+```bash
+IMG=ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-pi02w:ss-os-0.8.0-81-gbfbd791
+docker inspect "$IMG" --format '{{index .Config.Labels "org.seedsigner.target-profile"}}'
+docker run --rm --entrypoint sh "$IMG" -c \
+  '/output/host/bin/arm-Buildroot-linux-gnueabihf-readelf -A \
+     /output/host/arm-Buildroot-linux-gnueabihf/sysroot/lib/libc.so.6 \
+   | sed -n "s/.*Tag_CPU_arch: *//p" | head -1'
+```
 
 **Creating the publish tokens (one-time).** You need one token per registry,
 each scoped to *registry write only* and with a **short expiry** — they're used
@@ -175,17 +199,82 @@ rm -rf "$DOCKER_CONFIG"; unset DOCKER_CONFIG TOKEN TAG
 **4. Make the GHCR package public (first publish only).** A new GHCR package
 defaults to **private**, and fork PRs / unauthenticated CI runners cannot pull it —
 the build then fails at `docker pull` with an auth error rather than a clear 404.
-As `kdmukAI-bot`: **github.com/users/kdmukAI-bot/packages** → `sdk-armv6` →
-**Package settings** → **Danger Zone → Change visibility → Public**. Verify with a
-logged-out pull:
+As `kdmukAI-bot`: **github.com/users/kdmukAI-bot/packages** → `sdk-<profile>` →
+**Package settings** → **Danger Zone → Change visibility → Public**. This is
+per-package, so `sdk-armv6` being public says nothing about `sdk-pi02w`. Verify
+each with a logged-out pull:
 ```bash
-DOCKER_CONFIG="$(mktemp -d)" docker pull \
-  ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-armv6:ss-os-0.8.0-81-gbfbd791
+for p in armv6 pi02w; do
+  DOCKER_CONFIG="$(mktemp -d)" docker pull \
+    "ghcr.io/kdmukai-bot/seedsigner-raspi-lvgl/sdk-${p}:ss-os-0.8.0-81-gbfbd791"
+done
 ```
 
 > **Never** `echo "<token>" | docker login …` — that writes the literal token
 > into `~/.bash_history`. Always read it into a variable via `read -rs` (hidden,
 > not recorded) and pipe with `--password-stdin`.
+
+### Rebuilding and publishing the pre-baked Buildroot tree
+
+Distinct from the SDK, and easy to confuse with it. Both are slices of the *same*
+Buildroot build, published the same way, for different jobs:
+
+| | SDK (`sdk-<profile>`) | Prebake (`prebake-<board>`) |
+|---|---|---|
+| Carries | `output/host` — cross toolchain + target sysroot | `output/` incl. an allowlisted `build/` |
+| Size | ~1.5 GB | ~7.5 GB (~2 GB to pull) |
+| Answers | "compile this C++ for ARM" | "don't rebuild 200 OS packages" |
+| Produces | the `.so` | the flashable `.img` |
+| Keyed per | target **profile** (arch) | **board** (board + dev defconfig) |
+| Consumed by | `build.yml` **and** `dev-image.yml` | `dev-image.yml` only |
+
+The SDK is a *subset* of the prebake, kept separate because every PR pulls the SDK
+and nobody wants a multi-GB pull for a `.so` build.
+
+`dev-image.yml` restores the prebaked tree and re-runs only the payload tail —
+overlay copy, cpio, kernel relink — which is ~70 s per board instead of hours. That
+is what keeps per-run CI compute small; the expensive build happens here, locally,
+only when the seedsigner-os pin moves.
+
+Baking is two steps, because the tree that gets published is an allowlisted **slim**
+copy and it has to be validated by a real build before it ships:
+
+```bash
+# 1. materialise the slim tree alongside the full one (~16 GB -> ~4.5 GB).
+#    Runs the copy as root in a container: output/ is root-owned and target/'s
+#    uid/gid map into rootfs.cpio.
+SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output ./docker/slim_prebake_tree.sh
+
+# 2. validate it, then bake from the tree you validated. --slim refuses a full tree.
+#    Validation protocol: docs/knowledge/prebake-tree-slimming.md
+BOARD=pi0 SS_OS_OUTPUT_DIR=/path/to/seedsigner-os/output.slim \
+  ./docker/build_prebake_image.sh --slim
+```
+
+Slimming cuts CI peak disk from ~38 GB to ~12 GB, which is the point — the restore
+step holds the layers *and* the extracted copy at once. The variant is recorded as the
+`org.seedsigner.tree-variant` label, and `dev-image.yml` refuses anything but `slim`.
+
+The producer refuses rather than publishing a subtly wrong tree. It gates on:
+
+- **board + dev identity** — `BR2_ROOTFS_POST_BUILD_SCRIPT` in `output/.config` names
+  the board dir literally (`../pi0-dev/board/post-build.sh`), proving both at once.
+  Needed because a Buildroot tree carries no other sign of which board built it and
+  the build dir is reused across boards.
+- **the `build/` reachbacks** — the kernel tree (`linux-custom`, for the relink *and*
+  the DT-overlay `dtc`/`cpp` pass), `busybox-*/.config`, `python3-*/Lib/compileall.py`,
+  and `openssh-*/scp`. The last is **guarded** in `post-build.sh`, so its absence is
+  silent: dropbear's `scp` would ship with its client disabled, breaking `scp` on the
+  device with a green build. The producer hard-fails on it anyway.
+- **the tree variant** — full vs slim, detected structurally and recorded on the
+  image, so a consumer can tell which it is without measuring.
+
+It also strips `output/target/opt` at bake time, so no leftover app payload can
+collide with the first real one (`output/target` is additive — overlays are copied
+over it and never pruned).
+
+Push and make public exactly as for the SDK above, then set `PREBAKE_KEY` in
+`.github/workflows/dev-image.yml` to the new tag.
 
 ### Submodules
 

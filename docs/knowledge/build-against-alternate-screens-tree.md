@@ -25,10 +25,11 @@ LVGL.
 ## The mount constraint (the easy trap)
 
 The build runs in Docker with `WS_ROOT` mounted at `/workspace`, and `WS_ROOT` defaults to
-the **parent** of this repo (`$repo/..`, e.g. `/home/kdmukai/dev`). The override path must
-resolve to a **container** path under `/workspace`, so the alternate tree must live inside
-that mounted parent dir. A sibling clone at `/home/kdmukai/dev/seedsigner-lvgl-screens`
-becomes `/workspace/seedsigner-lvgl-screens` in the container:
+the **parent** of this repo (`$repo/..` — the shared workspace dir holding all four repos).
+The override path must resolve to a **container** path under `/workspace`, so the alternate
+tree must live inside that mounted parent dir. A sibling clone at
+`$WS_ROOT/seedsigner-lvgl-screens` becomes `/workspace/seedsigner-lvgl-screens` in the
+container:
 
 ```
 SEEDSIGNER_LVGL_SCREENS_DIR=/workspace/seedsigner-lvgl-screens ./run_build.sh

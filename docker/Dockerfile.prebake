@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# Transport container for a pre-baked SeedSigner OS Buildroot tree.
+#
+# A Buildroot build is dominated by compiling the toolchain and every package,
+# which depends only on the seedsigner-os ref -- so it is done ONCE here and
+# reused by every CI image build, which then re-runs only the payload tail
+# (overlay copy, cpio, kernel relink). See
+# docs/knowledge/dev-image-incremental-rebuild.md.
+#
+# This image is a CARRIER, not a build environment: CI extracts /output onto the
+# runner and hands it to the seedsigner-os build container, which is the thing
+# that actually compiles. The base is therefore just enough to be inspectable
+# (`docker run -it ... bash`) rather than a full toolchain.
+FROM debian:12-slim
+
+# Provenance of the tree baked in below. Supplied by docker/build_prebake_image.sh
+# from the seedsigner-os checkout the output was built in.
+#
+# BOARD is load-bearing, not decorative: a Buildroot output tree carries no
+# obvious sign of which board produced it, and the build directory is reused
+# across boards, so the only guard against publishing a pi0 tree as pi02w is the
+# identity check the producer runs against output/.config.
+ARG SS_OS_COMMIT=unknown
+ARG SS_OS_DESCRIBE=unknown
+ARG BUILDROOT_COMMIT=unknown
+ARG BOARD=unknown
+# slim = per-package build dirs reduced to an allowlist (see
+# docker/slim_prebake_tree.sh); full = the tree as Buildroot left it. Both build
+# identically; they differ ~4x in size, which is what governs CI peak disk.
+ARG TREE_VARIANT=unknown
+
+LABEL org.seedsigner.ss-os-commit="${SS_OS_COMMIT}" \
+      org.seedsigner.ss-os-describe="${SS_OS_DESCRIBE}" \
+      org.seedsigner.buildroot-commit="${BUILDROOT_COMMIT}" \
+      org.seedsigner.board="${BOARD}" \
+      org.seedsigner.tree-variant="${TREE_VARIANT}" \
+      org.seedsigner.dev-build="1" \
+      org.opencontainers.image.description="Pre-baked ${BOARD} dev Buildroot tree (${TREE_VARIANT}) from SeedSigner OS ${SS_OS_DESCRIBE}"
+
+# The built tree, at the absolute path Buildroot and build.sh expect. Buildroot
+# bakes absolute paths into its own artifacts, so /output must stay /output.
+COPY output/ /output/
+
+# Bake the tree with NO app payload staged. output/target is built up additively
+# -- target-finalize copies overlays over it and never prunes -- so a leftover
+# payload here would survive into the first CI image as stale files that no
+# overlay put there. Starting empty makes the first real payload authoritative.
+RUN rm -rf /output/target/opt
+
+RUN printf 'ss_os_commit=%s\nss_os_describe=%s\nbuildroot_commit=%s\nboard=%s\ntree_variant=%s\ndev_build=1\n' \
+      "${SS_OS_COMMIT}" "${SS_OS_DESCRIBE}" "${BUILDROOT_COMMIT}" "${BOARD}" "${TREE_VARIANT}" \
+      > /output/SS_OS_PREBAKE_PROVENANCE

@@ -3,8 +3,8 @@
 **Status:** design prep, not scheduled. RASPI-5 is endgame — its only consumer is **APP-10**
 (PIL display-pipeline teardown), which is itself gated on the wider PIL-GUI sunset. This doc
 exists so the *hard part* (the concurrency model) is worked out before implementation pressure;
-it is not an approval to build. Cross-repo status lives in `/home/kdmukai/dev/docs/cross-repo-ledger.md`
-(row RASPI-5).
+it is not an approval to build. Cross-repo status lives in the ecosystem-root ledger
+`docs/cross-repo-ledger.md` (the workspace parent holding all four repos), row RASPI-5.
 
 ## 1. What "own the panel" means, and why the blended pump exists today
 
