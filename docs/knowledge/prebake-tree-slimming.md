@@ -203,8 +203,12 @@ image hashes are not a valid change-detection signal.
 
 The reachback paths are **identical** in `pi0-dev` and `pi02w-dev`
 (`post-build.sh` lines 53/87/96-97, `post-image-seedsigner.sh` lines 8/17), so the
-allowlist is board-independent as written. The *validation* is still per-board: only
-pi0 has been run through the gate above.
+allowlist is board-independent as written — confirmed by running the gate on both.
+Re-read both hooks anyway when the OS pin moves; they are separate files and can drift.
+
+Both boards produce a 4.6 GB tree from a 16 GB one. pi02w measured 4636 files with an
+empty manifest diff and 5881 `target/` entries identical in ownership and mode; pi0,
+4635 and 5878.
 
 ## The variant is marked, not inferred
 

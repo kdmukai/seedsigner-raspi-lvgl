@@ -4,26 +4,26 @@ Per-merge CI that emits a flashable dev card per board. Local-dev only, pi0 + pi
 
 ## Current state
 
-**IN PROGRESS: baking the pre-baked Buildroot trees locally.** Everything else is
-written and awaiting those images.
+Both boards' pre-baked trees are published and public. **pi0 is green on a hosted
+runner** (run `30578590356`: 17 min, 94 MB `.img` artifact). The pi02w leg is enabled
+but has not yet run in CI — its tree passed the local validation gate.
 
 | Piece | State |
 |---|---|
-| `sdk-armv6`, `sdk-pi02w` on GHCR | done — public, labels verified at the registry |
-| `.github/workflows/dev-image.yml` | written; YAML + read-only permissions verified |
-| `docker/build_prebake_image.sh` + `Dockerfile.prebake` | written; syntax verified, gates unexercised |
-| `INCREMENTAL=1` in `scripts/build-dev-multiboard-image.sh` | written, unexercised |
-| lang-packs in CI | resolved — no code change needed, two workflow steps |
-| `prebake-pi0`, `prebake-pi02w` on GHCR | **← in progress (local bake + push)** |
-| First green run | blocked on the above |
-| Tree slimming | done for pi0 — validated, 21.6 GB → 7.44 GB image |
+| `sdk-armv6`, `sdk-pi02w` on GHCR | public, labels verified at the registry |
+| `prebake-pi0`, `prebake-pi02w` on GHCR | public, slim, `tree-variant` labelled |
+| `.github/workflows/dev-image.yml` | pi0 leg proven green; pi02w leg unexercised |
+| `docker/build_prebake_image.sh` + `Dockerfile.prebake` | exercised on both boards |
+| `docker/slim_prebake_tree.sh` | exercised and gated on both boards |
+| `INCREMENTAL=1` in `scripts/build-dev-multiboard-image.sh` | exercised, locally and in CI |
+| lang-packs in CI | two workflow steps, no code change |
 
 ## Shape, and why
 
 Two jobs, one per board, each restoring a pre-baked Buildroot tree and re-running only
-the payload tail (overlay copy, cpio, kernel relink) — ~70 s of OS build instead of
-hours. The expensive Buildroot build happens **locally, once per OS pin**, and is
-published as a GHCR image.
+the payload tail (overlay copy, cpio, kernel relink) instead of a ~90 min Buildroot
+build. The expensive build happens **locally, once per OS pin**, and is published as a
+GHCR image.
 
 That split is doing two jobs at once:
 
@@ -62,27 +62,26 @@ names its own provenance. Compatibility is proven by the workflow's **staleness 
 it fails if any `*_defconfig` or the buildroot submodule changed between the SDK's
 `ss-os-commit` label and the OS ref — not by the tags matching.
 
-## Known risks for the first run
+That gate needs the SDK's commit to be *present*, and `actions/checkout` is shallow by
+default, so the step fetches that single commit first. Deepening the whole clone would
+drag buildroot's full history in for one object lookup.
 
-1. **Peak disk during restore.** The step holds the image layers (~7.5 GB) *and* the
-   extracted copy (~4.9 GB) — ~12 GB, against ~38 GB before the tree was slimmed.
-   Runner free space after the reclaim step is still unmeasured, but this is no longer
-   the tightest constraint. `docs/knowledge/prebake-tree-slimming.md`.
-2. **Restore may dominate runtime.** Pulling + extracting ~2 GB of layers could exceed
-   the ~70 s build it exists to enable.
-3. **Unexercised paths**: the producer's gates, the `.config` board-identity `sed`, the
-   `.dockerignore` build-context handling, and `INCREMENTAL=1`.
+## Measured on the runner
+
+Peak disk is the restore step, which holds the image layers and the extracted copy at
+once: **~6 GB net, against 113 GB free** after the reclaim step. The runner is 145 GB,
+considerably larger than the ~30 GB this was originally designed against — so peak disk
+turned out not to be the binding constraint it was treated as. Slimming still earns its
+place on pull size (4.43 → 2.12 GB) and restore time.
 
 ## Open
 
-- **pi02w's slim tree is unvalidated.** The allowlist is board-independent as written
-  (both boards' hooks reach back to the same paths), but only pi0 has been through the
-  manifest gate. Run it when the pi02w tree is next built — the baseline is perishable,
-  so validate *before* moving on, per `docs/knowledge/prebake-tree-slimming.md`.
-
-## Not carried over from the local script
-
-`build-dev-multiboard-image.sh` patches `opt/build.sh` at run time (the bind-mount clean
-step) via an inline Python heredoc. CI inherits this because it calls the same script. It
-works, but it means a CI run mutates its seedsigner-os checkout — worth replacing with an
-upstream-friendly fix if the script ever grows a real CI mode.
+- **pi02w has never run in CI.** Its tree passed the local gate, but the pi0 leg is the
+  only one proven end to end on a runner.
+- **`build-dev-multiboard-image.sh` patches `opt/build.sh` at run time** (the bind-mount
+  clean step) via an inline Python heredoc. CI inherits this because it calls the same
+  script, so a CI run mutates its seedsigner-os checkout — worth replacing with an
+  upstream-friendly fix if the script ever grows a real CI mode.
+- **Re-baking when the OS pin moves** means both boards, and the trees cannot coexist:
+  `build.sh` clears the build dir per board. Validate each before moving on, since the
+  baseline is destroyed by the next board's build.

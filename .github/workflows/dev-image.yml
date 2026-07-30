@@ -87,13 +87,9 @@ jobs:
           - board: pi0
             profile: armv6
             sdk_repo: sdk-armv6
-          # pi02w is off: prebake-pi02w has not been baked, so this leg can only
-          # fail at `docker pull`. Re-enable by baking and publishing that tree --
-          # build the pi02w Buildroot tree, slim it, run the validation gate
-          # (docs/knowledge/prebake-tree-slimming.md), then uncomment.
-          # - board: pi02w
-          #   profile: pi02w
-          #   sdk_repo: sdk-pi02w
+          - board: pi02w
+            profile: pi02w
+            sdk_repo: sdk-pi02w
 
     steps:
       # Sibling layout under $GITHUB_WORKSPACE mirrors the local dev workspace, so
