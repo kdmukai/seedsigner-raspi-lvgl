@@ -165,8 +165,15 @@ jobs:
             --format '{{index .Config.Labels "org.seedsigner.ss-os-commit"}}')"
           echo "SDK sysroot from seedsigner-os ${SDK_OS_COMMIT}"
           cd seedsigner-os
+          # The checkout is shallow (actions/checkout defaults to depth 1), so the
+          # SDK's commit is absent even when it is an ancestor of the built ref.
+          # Fetch that one commit rather than deepening the clone: buildroot is a
+          # recursive submodule here and its full history dwarfs this check.
+          # A diff between two shallow commits is fine -- it compares trees, and
+          # both trees come with the fetch.
+          git fetch --depth=1 origin "${SDK_OS_COMMIT}" 2>/dev/null || true
           if ! git cat-file -e "${SDK_OS_COMMIT}^{commit}" 2>/dev/null; then
-            echo "::error::SDK's ss-os-commit ${SDK_OS_COMMIT} is not in this checkout; cannot prove the sysroot matches."
+            echo "::error::SDK's ss-os-commit ${SDK_OS_COMMIT} is not fetchable from this repo; cannot prove the sysroot matches."
             exit 1
           fi
           DRIFT="$(git diff --name-only "${SDK_OS_COMMIT}" HEAD -- \
